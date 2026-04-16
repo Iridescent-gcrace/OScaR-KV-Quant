@@ -299,6 +299,8 @@ struct Flash_fwd_kernel_traits : public Base {
         array_aligned<ElementKVPack, cosize_v<SmemLayoutVSize>> smem_Vpack;
         array_aligned<Params2, cosize_v<SmemLayoutVParams>> smem_Vparams;
         array_aligned<Element, cosize_v<SmemLayoutAcc>> smem_acc;
+        // 2-bit split/residual paths slightly overrun the last shared tile due to tile copy granularity.
+        array_aligned<Element, num_bits == 2 ? 512 : 1> smem_padding;
     };
     static constexpr int kSmemSize = int(sizeof(SharedStorage));
 
@@ -310,6 +312,8 @@ struct Flash_fwd_kernel_traits : public Base {
         array_aligned<ElementKVPack, cosize_v<SmemLayoutVSize>> smem_Vpack;
         array_aligned<Element, cosize_v<SmemLayoutAcc>> smem_acc;
         array_aligned<Params2, cosize_v<SmemLayoutKParams>> smem_Kparams;
+        // Keep a small tail pad for 2-bit residual kernels to avoid shared-memory edge writes.
+        array_aligned<Element, num_bits == 2 ? 512 : 1> smem_padding;
     };
     static constexpr int kSmemSize_res = int(sizeof(SharedStorage_residual));
 
