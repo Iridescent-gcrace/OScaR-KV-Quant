@@ -59,19 +59,23 @@ void allreduce_(Tensor0 &dst, Tensor1 &src, Tensor2 &reduce_tmp, Operator &op) {
         float val = quant::warp_reduce(src(i), op);
         // Write the result to shared memory for each group's leader
         if (lane_id < 4) {
-            reduce_tmp(i,warp_id * 4 + lane_id) = val;
+            auto &slot = reduce_tmp(i,warp_id * 4 + lane_id);
+            using SlotType = cute::remove_cvref_t<decltype(slot)>;
+            slot = SlotType(val);
         }
         __syncthreads();
-        
+
         // First thread in the first group reads all values and reduces them
         if (lane_id < 4) {
-            float final_val = reduce_tmp(i,0 + lane_id);
+            float final_val = float(reduce_tmp(i,0 + lane_id));
             #pragma unroll
             for (int w = 1; w < 4; w++) {  // For 4 warps
-                final_val = op(final_val, reduce_tmp(i,w * 4 + lane_id));
+                final_val = op(final_val, float(reduce_tmp(i,w * 4 + lane_id)));
             }
             // Write back the final result
-            reduce_tmp(i, 0 + lane_id) = final_val;
+            auto &slot2 = reduce_tmp(i, 0 + lane_id);
+            using SlotType2 = cute::remove_cvref_t<decltype(slot2)>;
+            slot2 = SlotType2(final_val);
         }
         __syncthreads();
         
@@ -138,8 +142,16 @@ struct qpack_kc_vt<2, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5> {
                 channel_scales_inv(i) = scale_inv;
                 channel_zeros(i) = min_i;
                 // Store scales and zeros
-                scales_k(i, k) = scale_inv == 0 ? 0.0f : 1.0f / scale_inv;  // Store actual scale
-                zeros_k(i, k) = min_i;
+                {
+                    auto &s_slot = scales_k(i, k);
+                    using S_T = cute::remove_cvref_t<decltype(s_slot)>;
+                    s_slot = S_T(scale_inv == 0 ? 0.0f : 1.0f / scale_inv);
+                }
+                {
+                    auto &z_slot = zeros_k(i, k);
+                    using Z_T = cute::remove_cvref_t<decltype(z_slot)>;
+                    z_slot = Z_T(min_i);
+                }
             }
 
             // Quantize and pack the tensor
@@ -247,8 +259,16 @@ struct qpack_kc_vt<4, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5> {
                 channel_scales_inv(i) = scale_inv;
                 channel_zeros(i) = min_i;
                 // Store scales and zeros
-                scales_k(i, k) = scale_inv == 0 ? 0.0f : 1.0f / scale_inv;  // Store actual scale
-                zeros_k(i, k) = min_i;
+                {
+                    auto &s_slot = scales_k(i, k);
+                    using S_T = cute::remove_cvref_t<decltype(s_slot)>;
+                    s_slot = S_T(scale_inv == 0 ? 0.0f : 1.0f / scale_inv);
+                }
+                {
+                    auto &z_slot = zeros_k(i, k);
+                    using Z_T = cute::remove_cvref_t<decltype(z_slot)>;
+                    z_slot = Z_T(min_i);
+                }
             }
 
             // Quantize and pack the tensor
@@ -408,8 +428,16 @@ void quant_Ktensor(Tensor1 &src, Tensor2 &dst,
         channel_scales_inv(i) = scale_inv;
         channel_zeros(i)      = min_i;
         // Store scales and zeros
-        scales_k_g(i)         = scale_inv == 0 ? 0.0f : 1.0f / scale_inv;  // Store actual scale
-        zeros_k_g(i)          = min_i;
+        {
+            auto &s_slot = scales_k_g(i);
+            using S_T = cute::remove_cvref_t<decltype(s_slot)>;
+            s_slot = S_T(scale_inv == 0 ? 0.0f : 1.0f / scale_inv);
+        }
+        {
+            auto &z_slot = zeros_k_g(i);
+            using Z_T = cute::remove_cvref_t<decltype(z_slot)>;
+            z_slot = Z_T(min_i);
+        }
     }
 
     // Pack the tensor
