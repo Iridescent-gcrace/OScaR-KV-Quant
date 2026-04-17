@@ -19,7 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union, TypedDict
 
 import torch
 from torch import nn
@@ -41,7 +41,12 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
+from transformers.utils import auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
+try:
+    from transformers.utils import LossKwargs
+except ImportError:
+    class LossKwargs(TypedDict, total=False):
+        pass
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from flash_attn import flash_attn_with_kvcache
@@ -676,7 +681,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            print("use_cache and past_key_values is None")
             past_key_values = DynamicCache()
 
         if cache_position is None:

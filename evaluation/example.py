@@ -1,9 +1,15 @@
 # LLaMA model with KIVI
 import warnings
 warnings.filterwarnings("ignore")
+import sys
+from pathlib import Path
 import torch
 import random
 import argparse
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from bit_decode import DynamicCache, StaticCache, Cache
 import transformers.cache_utils
@@ -11,16 +17,38 @@ transformers.cache_utils.DynamicCache = DynamicCache
 transformers.cache_utils.StaticCache = StaticCache
 transformers.cache_utils.Cache = Cache
 
-from llama import LlamaForCausalLM
-from qwen3 import Qwen3ForCausalLM
-from transformers import LlamaConfig, Qwen3Config, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 from datasets import load_dataset
+
+
+def resolve_model_components(model_path):
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    model_type = getattr(config, "model_type", None)
+    if model_type == "llama":
+        from llama import LlamaForCausalLM
+        return config, LlamaForCausalLM
+    if model_type == "qwen3":
+        from qwen3 import Qwen3ForCausalLM
+        return config, Qwen3ForCausalLM
+    raise ValueError(f"Unsupported model_type: {model_type}")
+
+
+def resolve_torch_dtype(config, dtype_name):
+    if dtype_name == "auto":
+        config_dtype = getattr(config, "torch_dtype", None)
+        if isinstance(config_dtype, str):
+            return getattr(torch, config_dtype)
+        if isinstance(config_dtype, torch.dtype):
+            return config_dtype
+        return torch.float16
+    return getattr(torch, dtype_name)
 
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Run LLaMA model with KIVI')
     parser.add_argument('--model_path', type=str, required=True, help='Path to the pretrained model')
     parser.add_argument('--max_length', type=int, default=131072, help='Maximum length of the input sequence')
+    parser.add_argument('--dtype', type=str, default='auto', help='Torch dtype: auto, float16, bfloat16, float32')
     parser.add_argument('--num_bits', type=int, default=4, help='Number of bits for quantization')
     parser.add_argument('--quant_mode', type=str, default='k-channel', help='Quantization mode')
     parser.add_argument('--group_size', type=int, default=128, help='Group size for quantization')
@@ -31,10 +59,8 @@ def main():
     random.seed(0)
     torch.manual_seed(0)
 
-    if "Llama" in args.model_path:
-        config = LlamaConfig.from_pretrained(args.model_path)
-    elif "Qwen" in args.model_path:
-        config = Qwen3Config.from_pretrained(args.model_path)
+    config, model_cls = resolve_model_components(args.model_path)
+    dtype = resolve_torch_dtype(config, args.dtype)
 
     config._attn_implementation = "flash_attention_2"
     config.attn_backend = args.attn_backend
@@ -43,22 +69,13 @@ def main():
     config.group_size = args.group_size
     config.residual_block_size = 128 if args.num_bits == 4 else 256
 
-    if "Llama" in args.model_path:
-        model = LlamaForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=args.model_path,
-            config=config,
-            low_cpu_mem_usage=True,
-            torch_dtype=torch.float16,
-            device_map="auto"
-        )
-    elif "Qwen" in args.model_path:
-        model = Qwen3ForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=args.model_path,
-            config=config,
-            low_cpu_mem_usage=True,
-            torch_dtype=torch.float16,
-            device_map="auto"
-        )
+    model = model_cls.from_pretrained(
+        pretrained_model_name_or_path=args.model_path,
+        config=config,
+        low_cpu_mem_usage=True,
+        dtype=dtype,
+        device_map="auto"
+    )
 
     enc = AutoTokenizer.from_pretrained(
         args.model_path,

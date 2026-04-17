@@ -1,11 +1,17 @@
 import argparse
 import dataclasses
+import sys
 import time
+from pathlib import Path
 import numpy as np
 import torch
 from tqdm.auto import tqdm
-from llama import LlamaForCausalLM
-from transformers import LlamaConfig, AutoTokenizer
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from transformers import AutoConfig
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -14,25 +20,49 @@ class ModelConfig:
 #   device: str = dataclasses.field(default="cuda:0")
 
 
+def resolve_model_components(model_path):
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    model_type = getattr(config, "model_type", None)
+    if model_type == "llama":
+        from llama import LlamaForCausalLM
+        return config, LlamaForCausalLM
+    if model_type == "qwen3":
+        from qwen3 import Qwen3ForCausalLM
+        return config, Qwen3ForCausalLM
+    raise ValueError(f"Unsupported model_type: {model_type}")
+
+
+def resolve_torch_dtype(config, dtype_name):
+    if dtype_name == "auto":
+        config_dtype = getattr(config, "torch_dtype", None)
+        if isinstance(config_dtype, str):
+            return getattr(torch, config_dtype)
+        if isinstance(config_dtype, torch.dtype):
+            return config_dtype
+        return torch.float16
+    return getattr(torch, dtype_name)
+
+
 def load_model(args):
     # device = torch.device(args.device)
-    dtype = getattr(torch, args.dtype)
+    config, model_cls = resolve_model_components(args.model_path)
+    dtype = resolve_torch_dtype(config, args.dtype)
     torch.set_default_dtype(dtype)
 
-    config = LlamaConfig.from_pretrained(args.model_path)
+    config._attn_implementation = "flash_attention_2"
     config.attn_backend = args.attn_backend
     config.num_bits = args.num_bits
     config.quant_mode = args.quant_mode
     config.group_size = args.group_size
     config.residual_block_size = 128 if args.num_bits == 4 else 256
 
-    model = LlamaForCausalLM.from_pretrained(
+    model = model_cls.from_pretrained(
         args.model_path,
         config=config,
         device_map="auto",
-        torch_dtype=dtype
+        dtype=dtype
     )
-    return model
+    return model, dtype
 
 @torch.inference_mode()
 def benchmark_throughput():
@@ -43,7 +73,7 @@ def benchmark_throughput():
     parser.add_argument("--decode_len", type=int, default=256)
     parser.add_argument("--iteration", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--dtype", type=str, default="float16")
+    parser.add_argument("--dtype", type=str, default="auto")
     parser.add_argument("--attn_backend", type=str, default="flash_attention_2")
     parser.add_argument("--num_bits", type=int, default=4)
     parser.add_argument("--quant_mode", type=str, default="k-channel")
@@ -51,13 +81,13 @@ def benchmark_throughput():
     
     args = parser.parse_args()
 
-    model = load_model(args)
+    model, model_dtype = load_model(args)
 
     context_len = args.context_len
     decode_len = args.decode_len
     batch_size = args.batch_size
     
-    dtype = getattr(torch, args.dtype)
+    dtype = model_dtype
     device = torch.device(args.device)
     hidden_size = model.config.hidden_size
 
@@ -122,7 +152,11 @@ def benchmark_throughput():
     print(f"Batch Size: {batch_size}")
     print(f"Context Length: {context_len}")
     print(f"Decode Length: {decode_len}")
-    print(f"Quantization: {args.num_bits}-bit {args.quant_mode}")
+    print(f"Attention Backend: {args.attn_backend}")
+    if args.attn_backend == "bit_decoding":
+        print(f"KV Cache Quantization: {args.num_bits}-bit {args.quant_mode}")
+    else:
+        print("KV Cache Quantization: full precision")
     print("\n--- Latency ---")
     print(f"Avg Prefill Latency: {avg_prefill_latency:.4f} s")
     print(f"Avg Decode Latency (total): {avg_decode_latency:.4f} s")

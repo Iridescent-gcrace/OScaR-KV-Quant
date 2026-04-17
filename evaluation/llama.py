@@ -18,7 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, TypedDict
 
 import torch
 import torch.utils.checkpoint
@@ -41,7 +41,6 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import (
-    LossKwargs,
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -49,6 +48,11 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
+try:
+    from transformers.utils import LossKwargs
+except ImportError:
+    class LossKwargs(TypedDict, total=False):
+        pass
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from flash_attn import flash_attn_with_kvcache
