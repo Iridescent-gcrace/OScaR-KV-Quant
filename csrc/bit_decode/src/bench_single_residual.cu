@@ -8,7 +8,7 @@ double TestDecodingKernelPerformance(int seqlen_kv, const std::string& quant_mod
     const int bs = 1;
     const int seqlen_q = 1;
     const int pack_nums = 16 / num_bits;
-    const int residual_block_size = num_bits == 4 ? 128 : 256;
+    const int residual_block_size = 128;
     int residual_len = seqlen_kv % residual_block_size == 0 ? residual_block_size : seqlen_kv % residual_block_size;
     seqlen_kv = seqlen_kv - residual_len;
 

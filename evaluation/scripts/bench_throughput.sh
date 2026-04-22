@@ -6,6 +6,8 @@ ITERATION="${ITERATION:-1}"
 NUM_BITS="${NUM_BITS:-4}"
 QUANT_MODE="${QUANT_MODE:-k-channel}"
 GROUP_SIZE="${GROUP_SIZE:-128}"
+KV_ROTATION="${KV_ROTATION:-none}"
+KV_NORM="${KV_NORM:-0}"
 ATTN_BACKEND="${ATTN_BACKEND:-flash_attention_2}"
 
 # BUDGET_POOL=('1024' '2048' '4096' '8192' '16384' '32768')
@@ -26,6 +28,8 @@ for batch_size in ${BATCH_SIZE[@]}; do
             --num_bits "${NUM_BITS}" \
             --quant_mode "${QUANT_MODE}" \
             --group_size "${GROUP_SIZE}" \
+            --kv_rotation "${KV_ROTATION}" \
+            --kv_norm "${KV_NORM}" \
             --attn_backend "${ATTN_BACKEND}"
     done
 done

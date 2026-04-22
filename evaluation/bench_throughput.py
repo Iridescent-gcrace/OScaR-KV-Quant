@@ -44,7 +44,6 @@ def resolve_torch_dtype(config, dtype_name):
 
 
 def load_model(args):
-    # device = torch.device(args.device)
     config, model_cls = resolve_model_components(args.model_path)
     dtype = resolve_torch_dtype(config, args.dtype)
     torch.set_default_dtype(dtype)
@@ -54,12 +53,14 @@ def load_model(args):
     config.num_bits = args.num_bits
     config.quant_mode = args.quant_mode
     config.group_size = args.group_size
-    config.residual_block_size = 128 if args.num_bits == 4 else 256
+    config.kv_rotation = args.kv_rotation
+    config.kv_norm = args.kv_norm
+    config.residual_block_size = 128
 
     model = model_cls.from_pretrained(
         args.model_path,
         config=config,
-        device_map="auto",
+        device_map={"": args.device},
         dtype=dtype
     )
     return model, dtype
@@ -78,6 +79,8 @@ def benchmark_throughput():
     parser.add_argument("--num_bits", type=int, default=4)
     parser.add_argument("--quant_mode", type=str, default="k-channel")
     parser.add_argument("--group_size", type=int, default=128)
+    parser.add_argument("--kv_rotation", type=str, default="none")
+    parser.add_argument("--kv_norm", type=str, default="0")
     
     args = parser.parse_args()
 

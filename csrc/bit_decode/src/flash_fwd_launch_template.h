@@ -200,7 +200,7 @@ void run_flash_qpack(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T, int quant_mode, int num_bits, int group_size>
 void run_kvcache_qpack_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
-    constexpr static int kBlockN = num_bits == 4 ? 128 : 256;
+    constexpr static int kBlockN = 128;
 
     run_flash_qpack<Flash_qpack_traits<Headdim, kBlockN, 4, quant_mode, num_bits, group_size, T>>(params, stream);
 }

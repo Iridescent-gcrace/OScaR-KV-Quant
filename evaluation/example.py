@@ -52,7 +52,10 @@ def main():
     parser.add_argument('--num_bits', type=int, default=4, help='Number of bits for quantization')
     parser.add_argument('--quant_mode', type=str, default='k-channel', help='Quantization mode')
     parser.add_argument('--group_size', type=int, default=128, help='Group size for quantization')
+    parser.add_argument('--kv_rotation', type=str, default='none', help='KV rotation mode, e.g. none or hadamard')
+    parser.add_argument('--kv_norm', type=str, default='0', help='KV norm mode, e.g. 0 or 1')
     parser.add_argument('--attn_backend', type=str, default='flash_attention_2', help='Attention implementation')
+    parser.add_argument('--device', type=str, default='cuda:0', help='Model/device placement')
     args = parser.parse_args()
 
     # For reproducibility 
@@ -67,14 +70,16 @@ def main():
     config.num_bits = args.num_bits
     config.quant_mode = args.quant_mode
     config.group_size = args.group_size
-    config.residual_block_size = 128 if args.num_bits == 4 else 256
+    config.kv_rotation = args.kv_rotation
+    config.kv_norm = args.kv_norm
+    config.residual_block_size = 128
 
     model = model_cls.from_pretrained(
         pretrained_model_name_or_path=args.model_path,
         config=config,
         low_cpu_mem_usage=True,
         dtype=dtype,
-        device_map="auto"
+        device_map={"": args.device}
     )
 
     enc = AutoTokenizer.from_pretrained(
@@ -99,7 +104,7 @@ def main():
         truncation=True,
         max_length=args.max_length,
         return_attention_mask=True
-    ).to('cuda')
+    ).to(args.device)
 
     output = model.generate(
         inputs.input_ids,

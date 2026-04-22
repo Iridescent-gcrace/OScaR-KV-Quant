@@ -128,6 +128,7 @@ if not SKIP_CUDA_BUILD:
             name="bit_decode_cuda",
             sources=[
                 "csrc/bit_decode/decode_api.cpp",
+                "csrc/bit_decode/src/k_preprocess.cu",
                 "csrc/bit_decode/src/genfile/flash_fwd_hdim128_fp16_sm80.cu",
                 "csrc/bit_decode/src/genfile/flash_qpack_hdim128_fp16_sm80_2bit.cu",
                 "csrc/bit_decode/src/genfile/flash_qpack_hdim128_fp16_sm80_4bit.cu",

@@ -78,7 +78,7 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int num_bits   = num_bits_;
     static constexpr int pack_num   = 16 / num_bits;
 
-    static constexpr int residual_block_size = num_bits == 4 ? 128 : 256;
+    static constexpr int residual_block_size = 128;
 
     // The number of threads.
     static constexpr int kNWarps    = kNWarps_;
@@ -86,7 +86,7 @@ struct Flash_fwd_kernel_traits : public Base {
 
     static constexpr int kBlockM            = kBlockM_;
     static constexpr int kBlockN            = kBlockN_;
-    static constexpr int kBlockN_pack       = num_bits   == 4 ? 128 : 256;
+    static constexpr int kBlockN_pack       = 128;
     static constexpr int kBlockN_residual   = kBlockN_pack;
     static constexpr int kBlockP            = quant_mode == 1 ? kBlockN / pack_num : kBlockN;
     static constexpr int kBlockP_new_pack   = quant_mode == 1 ? kBlockN_pack / pack_num : kBlockN_pack;
@@ -479,7 +479,7 @@ struct Flash_qpack_traits : public Base {
     static constexpr int kNThreads = kNWarps * 32;
     
     static constexpr int kBlockN           = kBlockN_;
-    static constexpr int kBlockN_pack      = num_bits   == 4 ? 128 : 256;
+    static constexpr int kBlockN_pack      = 128;
     static constexpr int kBlockP           = quant_mode == 1 ? kBlockN / pack_num : kBlockN;
     static constexpr int kBlockK_params    = quant_mode == 1 ? kBlockN / group_size : kBlockN;
     static constexpr int kHeadDim          = kHeadDim_;
