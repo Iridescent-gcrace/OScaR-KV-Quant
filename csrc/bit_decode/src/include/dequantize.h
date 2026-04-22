@@ -333,14 +333,14 @@ struct dequant_kc_vt<2, SourceEngine, SourceLayout, TargetEngine, TargetLayout, 
         using TQ2 = cute::uint32_t;
         using T   = typename TargetEngine::value_type;
         using T2  = typename ParamsType<T>::type;
-        const int num_params_ = num_params / 2;                // TODO: only for g128
-        const int pack_num    = 4 / num_params_;               // TODO: check 4
+        const int num_params_ = num_params / 2;
 
         // vectorize the source and target
         auto scales_vec  = cute::recast<T2>(scales);
         auto zeros_vec   = cute::recast<T2>(zeros);
         auto source_vec  = cute::recast<TQ2>(source);
         auto target_vec  = cute::recast<T2>(target);
+        const int pack_num = 4 / num_params_;
 
         const int channel_stride = size<0>(source_vec);
 

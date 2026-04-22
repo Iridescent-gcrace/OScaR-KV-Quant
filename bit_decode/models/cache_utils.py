@@ -466,7 +466,9 @@ class DynamicCache(Cache):
         super().__init__()
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
         self.key_cache: List[torch.Tensor] = []
+        self.key_cache_norm: List[torch.Tensor] = []
         self.key_cache_pack: List[torch.Tensor] = []
+        self.key_cache_norm_pack: List[torch.Tensor] = []
         self.key_cache_params: List[torch.Tensor] = []
 
         self.value_cache: List[torch.Tensor] = []
@@ -579,8 +581,12 @@ class DynamicCache(Cache):
         Return:
             A tuple containing the updated key and value states.
         """
+        key_norm_states = cache_kwargs.get("key_norm_states") if cache_kwargs is not None else None
+
         # Update the cache
         if key_states is not None:
+            while len(self.key_cache_norm) < layer_idx:
+                self.key_cache_norm.append([])
 
             # Update the number of seen tokens
             # if layer_idx == 0:
@@ -591,16 +597,30 @@ class DynamicCache(Cache):
                 for _ in range(len(self.key_cache), layer_idx):
                     self.key_cache.append([])
                     self.value_cache.append([])
+                    self.key_cache_norm.append([])
                 self.key_cache.append(key_states)
                 self.value_cache.append(value_states)
+                self.key_cache_norm.append(key_norm_states if key_norm_states is not None else torch.tensor([]))
             elif (
                 len(self.key_cache[layer_idx]) == 0
             ):  # fills previously skipped layers; checking for tensor causes errors
                 self.key_cache[layer_idx] = key_states
                 self.value_cache[layer_idx] = value_states
+                self.key_cache_norm[layer_idx] = key_norm_states if key_norm_states is not None else torch.tensor([])
             else:
                 self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-3)
                 self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-3)
+                if key_norm_states is None:
+                    if isinstance(self.key_cache_norm[layer_idx], torch.Tensor) and self.key_cache_norm[layer_idx].numel():
+                        ones = self.key_cache_norm[layer_idx].new_ones((key_states.shape[0], key_states.shape[1]))
+                        self.key_cache_norm[layer_idx] = torch.cat([self.key_cache_norm[layer_idx], ones], dim=-1)
+                elif (
+                    not isinstance(self.key_cache_norm[layer_idx], torch.Tensor)
+                    or self.key_cache_norm[layer_idx].numel() == 0
+                ):
+                    self.key_cache_norm[layer_idx] = key_norm_states
+                else:
+                    self.key_cache_norm[layer_idx] = torch.cat([self.key_cache_norm[layer_idx], key_norm_states], dim=-1)
 
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
@@ -629,8 +649,12 @@ class DynamicCache(Cache):
         Return:
             A tuple containing the updated key and value states.
         """
+        key_norm_states = cache_kwargs.get("key_norm_states") if cache_kwargs is not None else None
+
         # Update the cache
         if key_pack is not None:
+            while len(self.key_cache_norm_pack) < layer_idx:
+                self.key_cache_norm_pack.append([])
             # Update the number of seen tokens
             # if layer_idx == 0:
             #     self._seen_tokens += value_pack.shape[-3]
@@ -640,10 +664,12 @@ class DynamicCache(Cache):
                 for _ in range(len(self.key_cache_pack), layer_idx):
                     self.key_cache_pack.append([])
                     self.value_cache_pack.append([])
+                    self.key_cache_norm_pack.append([])
                     self.key_cache_params.append([])
                     self.value_cache_params.append([])
                 self.key_cache_pack.append(key_pack)
                 self.value_cache_pack.append(value_pack)
+                self.key_cache_norm_pack.append(key_norm_states if key_norm_states is not None else torch.tensor([]))
                 self.key_cache_params.append(key_params)
                 self.value_cache_params.append(value_params)
             elif (
@@ -651,27 +677,53 @@ class DynamicCache(Cache):
             ):  # fills previously skipped layers; checking for tensor causes errors
                 self.key_cache_pack[layer_idx] = key_pack
                 self.value_cache_pack[layer_idx] = value_pack
+                self.key_cache_norm_pack[layer_idx] = key_norm_states if key_norm_states is not None else torch.tensor([])
                 self.key_cache_params[layer_idx] = key_params
                 self.value_cache_params[layer_idx] = value_params
             else:
                 self.key_cache_pack[layer_idx] = torch.cat([self.key_cache_pack[layer_idx], key_pack], dim=-3).contiguous()
                 self.value_cache_pack[layer_idx] = torch.cat([self.value_cache_pack[layer_idx], value_pack], dim=-3).contiguous()
+                if key_norm_states is None:
+                    if isinstance(self.key_cache_norm_pack[layer_idx], torch.Tensor) and self.key_cache_norm_pack[layer_idx].numel():
+                        ones = self.key_cache_norm_pack[layer_idx].new_ones((key_pack.shape[0], value_pack.shape[1]))
+                        self.key_cache_norm_pack[layer_idx] = torch.cat([self.key_cache_norm_pack[layer_idx], ones], dim=-1).contiguous()
+                elif (
+                    not isinstance(self.key_cache_norm_pack[layer_idx], torch.Tensor)
+                    or self.key_cache_norm_pack[layer_idx].numel() == 0
+                ):
+                    self.key_cache_norm_pack[layer_idx] = key_norm_states
+                else:
+                    self.key_cache_norm_pack[layer_idx] = torch.cat(
+                        [self.key_cache_norm_pack[layer_idx], key_norm_states], dim=-1
+                    ).contiguous()
                 self.key_cache_params[layer_idx] = torch.cat([self.key_cache_params[layer_idx], key_params], dim=-3).contiguous()
                 self.value_cache_params[layer_idx] = torch.cat([self.value_cache_params[layer_idx], value_params], dim=-1).contiguous()
 
         return self.key_cache_pack[layer_idx], self.key_cache_params[layer_idx], self.value_cache_pack[layer_idx], self.value_cache_params[layer_idx]
+
+    def get_residual_norm(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if len(self.key_cache_norm) <= layer_idx:
+            return None
+        return self.key_cache_norm[layer_idx]
+
+    def get_pack_norm(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if len(self.key_cache_norm_pack) <= layer_idx:
+            return None
+        return self.key_cache_norm_pack[layer_idx]
     
     def clear_residual(self, layer_idx: int):
         self.key_cache[layer_idx] = []
         self.value_cache[layer_idx] = []
+        if len(self.key_cache_norm) > layer_idx:
+            self.key_cache_norm[layer_idx] = []
         
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
         # TODO: deprecate this function in favor of `cache_position`
         is_empty_layer = (
-            len(self.key_cache) == 0  # no cache in any layer
-            or len(self.key_cache) <= layer_idx  # skipped `layer_idx` and hasn't run a layer with cache after it
-            or not self.key_cache[layer_idx].numel()  # the layer has no cache
+            len(self.key_cache) == 0
+            or len(self.key_cache) <= layer_idx
+            or not self.key_cache[layer_idx].numel()
         )
         layer_seq_length = self.key_cache[layer_idx].shape[-2] if not is_empty_layer else 0
         return layer_seq_length

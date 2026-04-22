@@ -50,7 +50,7 @@ except ImportError:
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from flash_attn import flash_attn_with_kvcache
-from bit_decode import kvcache_pack_int, fwd_kvcache_int
+from bit_decode import preprocess_k_cache, kvcache_pack_int, fwd_kvcache_int
 from bit_decode import Cache, DynamicCache, StaticCache
 
 if is_torch_flex_attn_available():
@@ -335,6 +335,170 @@ class Qwen3FlashDecodingAttention(Qwen3Attention):
 class Qwen3BitDecoding(Qwen3Attention):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__(config, layer_idx)
+        self.kv_rotation = getattr(config, "kv_rotation", "none")
+        self.kv_norm = str(getattr(config, "kv_norm", "0"))
+        self.kernel_pack_block_size = 128
+        self.kernel_residual_pack_block_size = 128
+        if self.num_bits == 2 and self.quant_mode == "k-channel" and self.residual_block_size != 128:
+            logger.warning_once(
+                f"Overriding Qwen3 2-bit k-channel residual_block_size from {self.residual_block_size} to 128 to match the CUDA pack/flush block size."
+            )
+            self.residual_block_size = 128
+
+    def _use_custom_kv_transform(self) -> bool:
+        return self.num_bits == 2 and (self.kv_rotation == "hadamard" or self.kv_norm == "1")
+
+    def _needs_short_prefill_pack(self) -> bool:
+        return self.quant_mode == "k-channel" and self.num_bits == 2 and self.residual_block_size < self.kernel_pack_block_size
+
+    def _uses_python_decode_flush(self) -> bool:
+        return self.quant_mode == "k-channel" and self.num_bits == 2 and self.residual_block_size < self.kernel_residual_pack_block_size
+
+    def _allocate_pack_tensors(
+        self,
+        batch_size: int,
+        seqlen_k: int,
+        nheads_k: int,
+        d: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        k_pack = torch.zeros((batch_size, int(seqlen_k // self.pack_nums), nheads_k, d), dtype=torch.uint16, device=device)
+        k_params = torch.zeros((batch_size, int(seqlen_k // self.group_size), nheads_k, d), dtype=torch.float32, device=device)
+        v_pack = torch.zeros((batch_size, seqlen_k, nheads_k, int(d // self.pack_nums)), dtype=torch.uint16, device=device)
+        v_params = torch.zeros((batch_size, int(d // self.group_size), nheads_k, seqlen_k), dtype=torch.float32, device=device)
+        return k_pack, k_params, v_pack, v_params
+
+    @staticmethod
+    def _build_cu_seqlens(batch_size: int, seqlen_k: int, device: torch.device) -> torch.Tensor:
+        return torch.arange(0, (batch_size + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device=device)
+
+    def _pack_kv_cache_exact(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seqlen_k, nheads_k, d = key_states.shape
+        k_pack, k_params, v_pack, v_params = self._allocate_pack_tensors(batch_size, seqlen_k, nheads_k, d, key_states.device)
+        cu_seqlens_k = self._build_cu_seqlens(batch_size, seqlen_k, key_states.device)
+        kvcache_pack_int(
+            key_states,
+            k_pack,
+            k_params,
+            value_states,
+            v_pack,
+            v_params,
+            None,
+            cu_seqlens_k,
+            seqlen_k,
+            self.quant_mode,
+            self.group_size,
+            self.num_bits,
+        )
+        return k_pack, k_params, v_pack, v_params
+
+    def _pack_kv_cache_short_block(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seqlen_k, nheads_k, d = key_states.shape
+        pad_block = self.kernel_pack_block_size
+        if seqlen_k == pad_block:
+            return self._pack_kv_cache_exact(key_states, value_states)
+
+        if seqlen_k <= 0 or seqlen_k > pad_block:
+            raise ValueError(f"Short-block pack expects 1..{pad_block} tokens, got {seqlen_k}.")
+
+        padded_k = key_states.new_zeros((batch_size, pad_block, nheads_k, d))
+        padded_v = value_states.new_zeros((batch_size, pad_block, nheads_k, d))
+        padded_k[:, :seqlen_k] = key_states
+        padded_v[:, :seqlen_k] = value_states
+
+        k_pack, k_params, v_pack, v_params = self._pack_kv_cache_exact(padded_k, padded_v)
+        pack_rows = int(seqlen_k // self.pack_nums)
+        param_rows = int(seqlen_k // self.group_size)
+        return (
+            k_pack[:, :pack_rows].contiguous(),
+            k_params[:, :param_rows].contiguous(),
+            v_pack[:, :seqlen_k].contiguous(),
+            v_params[:, :, :, :seqlen_k].contiguous(),
+        )
+
+    @staticmethod
+    def _optional_cache_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return None
+        return tensor.contiguous()
+
+    def _preprocess_key_cache_states(
+        self,
+        key_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        apply_hadamard = self.kv_rotation == "hadamard"
+        apply_norm = self.kv_norm == "1"
+
+        if not apply_hadamard and not apply_norm:
+            return key_states.contiguous(), None
+
+        if (
+            not key_states.is_cuda
+            or key_states.dtype not in (torch.float16, torch.bfloat16)
+            or key_states.shape[-1] != 128
+        ):
+            raise NotImplementedError(
+                "Custom Qwen3 2-bit K transform requires CUDA fp16/bf16 tensors with head_dim=128."
+            )
+
+        key_states, key_norm_states = preprocess_k_cache(
+            key_states,
+            apply_hadamard=apply_hadamard,
+            apply_norm=apply_norm,
+        )
+        return key_states.contiguous(), self._optional_cache_tensor(key_norm_states)
+
+    def _pack_kv_cache_block(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_k: int,
+        key_norm_states: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        batch_size, seqlen_k, nheads_k, d = key_states.shape
+
+        if self.quant_mode != "k-channel":
+            raise NotImplementedError("Custom KV transform path currently only supports k-channel quantization.")
+        if seqlen_k % self.group_size != 0:
+            raise ValueError(
+                f"Custom KV transform path requires seqlen ({seqlen_k}) divisible by group_size ({self.group_size})."
+            )
+
+        if self.kv_norm == "1":
+            if key_norm_states is None:
+                raise ValueError("Token-wise key norms must be provided when kv_norm is enabled.")
+
+        if not self._needs_short_prefill_pack() or seqlen_k % self.kernel_pack_block_size == 0:
+            k_pack, k_params, v_pack, v_params = self._pack_kv_cache_exact(key_states, value_states)
+            return k_pack, k_params, v_pack, v_params, self._optional_cache_tensor(key_norm_states)
+
+        full_kernel_len = (seqlen_k // self.kernel_pack_block_size) * self.kernel_pack_block_size
+        tail_len = seqlen_k - full_kernel_len
+        outputs = []
+
+        if full_kernel_len > 0:
+            outputs.append(self._pack_kv_cache_exact(key_states[:, :full_kernel_len], value_states[:, :full_kernel_len]))
+        if tail_len > 0:
+            outputs.append(self._pack_kv_cache_short_block(key_states[:, full_kernel_len:], value_states[:, full_kernel_len:]))
+
+        if len(outputs) == 1:
+            k_pack, k_params, v_pack, v_params = outputs[0]
+        else:
+            k_pack = torch.cat([item[0] for item in outputs], dim=1).contiguous()
+            k_params = torch.cat([item[1] for item in outputs], dim=1).contiguous()
+            v_pack = torch.cat([item[2] for item in outputs], dim=1).contiguous()
+            v_params = torch.cat([item[3] for item in outputs], dim=-1).contiguous()
+
+        return k_pack, k_params, v_pack, v_params, self._optional_cache_tensor(key_norm_states)
     
     def forward(
         self,
@@ -360,10 +524,12 @@ class Qwen3BitDecoding(Qwen3Attention):
         query_states_rope = query_states.transpose(1, 2)
         key_states_rope = key_states.transpose(1, 2)
         query_states_rope, key_states_rope = apply_rotary_pos_emb(query_states_rope, key_states_rope, cos, sin)
-        
+
         batch_size = query_states.shape[0]
         device = query_states.device
         dtype = query_states.dtype
+        use_custom_kv_transform = self._use_custom_kv_transform()
+        key_norm_states = None
         
         if q_len == 1:
             # Decoding path: use (batch, seq, num_heads, head_dim) format directly
@@ -371,25 +537,41 @@ class Qwen3BitDecoding(Qwen3Attention):
             query_states = query_states_rope.transpose(1, 2)
             key_states = key_states_rope.transpose(1, 2)
             # value_states already in correct format
+            if use_custom_kv_transform:
+                logger.warning_once(
+                    "Using custom Qwen3 2-bit KV transform path: Hadamard/norm preprocessing with the existing 2-bit BitDecoding CUDA kernels."
+                )
+                key_states, key_norm_states = self._preprocess_key_cache_states(key_states)
+                value_states = value_states.contiguous()
             
             nheads_k = key_states.shape[2]
             d = key_states.shape[3]
+            kernel_residual_block_size = self.kernel_residual_pack_block_size
 
             k_pack, k_params, v_pack, v_params = past_key_value.update_pack(None, None, None, None, self.layer_idx)
+            k_norm_pack = self._optional_cache_tensor(past_key_value.get_pack_norm(self.layer_idx))
 
             seqlen_pack = v_pack.shape[1]
 
             seqlens_k = torch.full((batch_size,), seqlen_pack, dtype=torch.int32, device=device)
 
             # Get kv cache_residual and append new kv
-            k_residual = torch.zeros((batch_size, self.residual_block_size, nheads_k, d), device=device, dtype=dtype)
-            v_residual = torch.zeros((batch_size, self.residual_block_size, nheads_k, d), device=device, dtype=dtype)
-            k_residual_cache, v_residual_cache = past_key_value.update_residual(key_states, value_states, self.layer_idx)
+            k_residual = torch.zeros((batch_size, kernel_residual_block_size, nheads_k, d), device=device, dtype=dtype)
+            v_residual = torch.zeros((batch_size, kernel_residual_block_size, nheads_k, d), device=device, dtype=dtype)
+            residual_cache_kwargs = {"key_norm_states": key_norm_states} if key_norm_states is not None else None
+            k_residual_cache, v_residual_cache = past_key_value.update_residual(
+                key_states, value_states, self.layer_idx, residual_cache_kwargs
+            )
+            k_norm_residual_cache = self._optional_cache_tensor(past_key_value.get_residual_norm(self.layer_idx))
 
             cur_residual_len = k_residual_cache.shape[1]         
         
             k_residual[:, :cur_residual_len, :, :] = k_residual_cache
             v_residual[:, :cur_residual_len, :, :] = v_residual_cache
+            k_norm_residual = None
+            if k_norm_residual_cache is not None:
+                k_norm_residual = torch.ones((batch_size, kernel_residual_block_size), device=device, dtype=dtype)
+                k_norm_residual[:, :cur_residual_len] = k_norm_residual_cache.to(dtype)
 
             # Run attention with KV cache
             attn_output, self.k_pack_new, self.k_params_new, self.v_pack_new, self.v_params_new = fwd_kvcache_int(
@@ -402,13 +584,35 @@ class Qwen3BitDecoding(Qwen3Attention):
                 1.0 / math.sqrt(d), # sm_scale
                 self.quant_mode, 
                 self.group_size,
-                self.residual_block_size,
+                kernel_residual_block_size,
                 cur_residual_len, # new_lens
-                self.num_bits
+                self.num_bits,
+                k_norm_pack,
+                k_norm_residual,
             )
-                
+
             if cur_residual_len == self.residual_block_size:
-                k_pack, k_params, v_pack, v_params = past_key_value.update_pack(self.k_pack_new, self.k_params_new, self.v_pack_new, self.v_params_new, self.layer_idx)
+                if self._uses_python_decode_flush():
+                    seqlens_k_flush = self._build_cu_seqlens(batch_size, cur_residual_len, device)
+                    k_pack_flush, k_params_flush, v_pack_flush, v_params_flush, k_norm_pack_new = self._pack_kv_cache_block(
+                        k_residual_cache,
+                        v_residual_cache,
+                        seqlens_k_flush,
+                        cur_residual_len,
+                        k_norm_residual_cache,
+                    )
+                    pack_cache_kwargs = {"key_norm_states": k_norm_pack_new} if k_norm_pack_new is not None else None
+                    past_key_value.update_pack(
+                        k_pack_flush, k_params_flush, v_pack_flush, v_params_flush, self.layer_idx, pack_cache_kwargs
+                    )
+                else:
+                    k_norm_pack_new = None
+                    if k_norm_residual_cache is not None:
+                        k_norm_pack_new = self._optional_cache_tensor(k_norm_residual_cache)
+                    pack_cache_kwargs = {"key_norm_states": k_norm_pack_new} if k_norm_pack_new is not None else None
+                    past_key_value.update_pack(
+                        self.k_pack_new, self.k_params_new, self.v_pack_new, self.v_params_new, self.layer_idx, pack_cache_kwargs
+                    )
                 past_key_value.clear_residual(self.layer_idx)
 
             attn_weights = None
@@ -446,11 +650,13 @@ class Qwen3BitDecoding(Qwen3Attention):
             d = key_states.shape[3]
             seqlen_k = key_states.shape[1]
 
-            cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device=device)
-
             residual_len = seqlen_k % self.residual_block_size
             residual     = residual_len > 0
             seqlen_k_pack = seqlen_k - residual_len
+            cu_seqlens_k_pack = (
+                self._build_cu_seqlens(batch_size, seqlen_k_pack, device)
+                if seqlen_k_pack > 0 else None
+            )
 
             if self.quant_mode == 'k-channel':
                 k_pack   = torch.zeros((batch_size, int(seqlen_k_pack // self.pack_nums), nheads_k, d),  dtype=torch.uint16, device=device)
@@ -464,28 +670,64 @@ class Qwen3BitDecoding(Qwen3Attention):
                 v_state_residual = value_states[:, -residual_len:, :, :]
                 k_state_past = key_states[:, :-residual_len, :, :]
                 v_state_past = value_states[:, :-residual_len, :, :]
-                past_key_value.update_residual(k_state_residual, v_state_residual, self.layer_idx)
+                if use_custom_kv_transform:
+                    k_state_residual, k_norm_residual = self._preprocess_key_cache_states(k_state_residual)
+                    v_state_residual = v_state_residual.contiguous()
+                else:
+                    k_state_residual = k_state_residual.contiguous()
+                    v_state_residual = v_state_residual.contiguous()
+                    k_norm_residual = None
+                residual_cache_kwargs = {"key_norm_states": k_norm_residual} if k_norm_residual is not None else None
+                past_key_value.update_residual(k_state_residual, v_state_residual, self.layer_idx, residual_cache_kwargs)
             else:
                 k_state_past = key_states
                 v_state_past = value_states
+                k_norm_residual = None
 
-            kvcache_pack_int(
-                k_state_past, k_pack, k_params,
-                v_state_past, v_pack, v_params,
-                None, # opt_block_table
-                cu_seqlens_k,              
-                seqlen_k,
-                self.quant_mode,
-                self.group_size,
-                self.num_bits
-            )
+            if use_custom_kv_transform and seqlen_k_pack > 0:
+                k_norm_pack = kvcache_pack_int(
+                    k_state_past, k_pack, k_params,
+                    v_state_past, v_pack, v_params,
+                    None, # opt_block_table
+                    cu_seqlens_k_pack,
+                    seqlen_k_pack,
+                    self.quant_mode,
+                    self.group_size,
+                    self.num_bits,
+                    apply_k_hadamard=self.kv_rotation == "hadamard",
+                    apply_k_norm=self.kv_norm == "1",
+                )
+            elif self._needs_short_prefill_pack() and seqlen_k_pack > 0:
+                k_pack, k_params, v_pack, v_params, k_norm_pack = self._pack_kv_cache_block(
+                    k_state_past,
+                    v_state_past,
+                    cu_seqlens_k_pack,
+                    k_state_past.shape[1],
+                    None,
+                )
+            elif seqlen_k_pack > 0:
+                kvcache_pack_int(
+                    k_state_past, k_pack, k_params,
+                    v_state_past, v_pack, v_params,
+                    None, # opt_block_table
+                    cu_seqlens_k_pack,
+                    seqlen_k_pack,
+                    self.quant_mode,
+                    self.group_size,
+                    self.num_bits
+                )
+                k_norm_pack = None
+            else:
+                k_norm_pack = None
 
-            past_key_value.update_pack(k_pack, k_params, v_pack, v_params, self.layer_idx) 
+            pack_cache_kwargs = {"key_norm_states": k_norm_pack} if k_norm_pack is not None else None
+            past_key_value.update_pack(k_pack, k_params, v_pack, v_params, self.layer_idx, pack_cache_kwargs) 
 
-            self.k_pack_new = torch.empty((batch_size, int(self.residual_block_size // self.pack_nums), nheads_k, k_pack.size(-1)),  dtype=torch.uint16, device=device)
-            self.k_params_new = torch.empty((batch_size, int(self.residual_block_size // self.group_size), nheads_k, k_params.size(-1)), dtype=torch.float32, device=device)
-            self.v_pack_new = torch.empty((batch_size, self.residual_block_size, nheads_k, v_pack.size(-1)), dtype=torch.uint16, device=device)
-            self.v_params_new = torch.empty((batch_size, v_params.size(1), nheads_k, self.residual_block_size), dtype=torch.float32, device=device)
+            kernel_flush_block_size = self.kernel_residual_pack_block_size
+            self.k_pack_new = torch.empty((batch_size, int(kernel_flush_block_size // self.pack_nums), nheads_k, k_pack.size(-1)),  dtype=torch.uint16, device=device)
+            self.k_params_new = torch.empty((batch_size, int(kernel_flush_block_size // self.group_size), nheads_k, k_params.size(-1)), dtype=torch.float32, device=device)
+            self.v_pack_new = torch.empty((batch_size, kernel_flush_block_size, nheads_k, v_pack.size(-1)), dtype=torch.uint16, device=device)
+            self.v_params_new = torch.empty((batch_size, v_params.size(1), nheads_k, kernel_flush_block_size), dtype=torch.float32, device=device)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)

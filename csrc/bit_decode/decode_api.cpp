@@ -20,6 +20,12 @@
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+std::tuple<at::Tensor, at::Tensor> preprocess_k_cache_cuda(
+    const at::Tensor &key_states,
+    bool apply_hadamard,
+    bool apply_norm
+);
+
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
@@ -327,17 +333,19 @@ mha_fwd_kvcache(at::Tensor &q,                       // batch_size x seqlen_q x 
                 at::Tensor &v_pack_new,
                 at::Tensor &v_params_new,
                 c10::optional<at::Tensor> &block_table_,        // batch_size x max_num_blocks_per_seq
-                const float softmax_scale=1.0,
-                const std::string quant_mode="k-tensor",
-                const int group_size=128,
-                const int residual_block_size=128,
-                const int new_lens=0,
-                bool is_causal=false,
-                int window_size_left=-1,
-                int window_size_right=-1,
-                const float softcap=0.0,
-                bool is_rotary_interleaved=true,                // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits=0
+                const float softmax_scale,
+                const std::string quant_mode,
+                const int group_size,
+                const int residual_block_size,
+                const int new_lens,
+                bool is_causal,
+                int window_size_left,
+                int window_size_right,
+                const float softcap,
+                bool is_rotary_interleaved,                // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+                int num_splits,
+                c10::optional<const at::Tensor> &k_norm_,
+                c10::optional<const at::Tensor> &k_norm_new_
                 ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -437,6 +445,19 @@ mha_fwd_kvcache(at::Tensor &q,                       // batch_size x seqlen_q x 
                      group_size
                      );
 
+    if (k_norm_.has_value()) {
+        auto k_norm = k_norm_.value();
+        TORCH_CHECK(k_norm.dtype() == q_dtype, "Packed key norm must have the same dtype as query");
+        TORCH_CHECK(k_norm.dim() == 2, "Packed key norm must have shape [batch, seqlen_k]");
+        TORCH_CHECK(k_norm.size(0) == batch_size_c, "Packed key norm batch dimension mismatch");
+        TORCH_CHECK(k_norm.stride(-1) == 1, "Packed key norm tensor must have contiguous last dimension");
+        CHECK_DEVICE(k_norm);
+
+        params.k_norm_ptr = k_norm.data_ptr();
+        params.k_norm_batch_stride = k_norm.stride(0);
+        params.k_norm_row_stride = k_norm.stride(-1);
+    }
+
     at::Tensor k, v;
     if (k_.has_value()) {
         TORCH_CHECK(v_.has_value(), "If key is supplied, value must also be passed in");
@@ -471,6 +492,19 @@ mha_fwd_kvcache(at::Tensor &q,                       // batch_size x seqlen_q x 
         params.knew_head_stride  = k.stride(-2);
         params.vnew_head_stride  = v.stride(-2);
         params.cu_seqlens_k      = static_cast<int *>(seqlens_k.data_ptr());
+
+        if (k_norm_new_.has_value()) {
+            auto k_norm_new = k_norm_new_.value();
+            TORCH_CHECK(k_norm_new.dtype() == q_dtype, "Residual key norm must have the same dtype as query");
+            TORCH_CHECK(k_norm_new.dim() == 2, "Residual key norm must have shape [batch, residual_block_size]");
+            TORCH_CHECK(k_norm_new.size(0) == batch_size, "Residual key norm batch dimension mismatch");
+            TORCH_CHECK(k_norm_new.stride(-1) == 1, "Residual key norm tensor must have contiguous last dimension");
+            CHECK_DEVICE(k_norm_new);
+
+            params.k_norm_new_ptr = k_norm_new.data_ptr();
+            params.k_norm_new_batch_stride = k_norm_new.stride(0);
+            params.k_norm_new_row_stride = k_norm_new.stride(-1);
+        }
 
         const int pack_nums = 16 / num_bits;
         
@@ -684,11 +718,70 @@ void kvcache_qpack(const at::Tensor &k, at::Tensor &k_pack, at::Tensor &k_params
     return;
 }
 
+template <int num_bits>
+at::Tensor kvcache_qpack_preprocess_k(
+    const at::Tensor &k,
+    at::Tensor &k_pack,
+    at::Tensor &k_params,
+    const at::Tensor &v,
+    at::Tensor &v_pack,
+    at::Tensor &v_params,
+    c10::optional<at::Tensor> &block_table_,
+    const at::Tensor &cu_seqlens_k,
+    const int max_seqlen_k,
+    const std::string quant_mode,
+    const int group_size,
+    const bool apply_hadamard,
+    const bool apply_norm
+) {
+    TORCH_CHECK(k.dim() == 4, "Expected key tensor with shape [batch, seqlen, num_heads, head_dim]");
+    TORCH_CHECK(v.dim() == 4, "Expected value tensor with shape [batch, seqlen, num_heads, head_dim]");
+    TORCH_CHECK(k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2) && k.size(3) == v.size(3),
+                "K/V tensor shapes must match for combined preprocess+pack");
+
+    auto k_contig = k.contiguous();
+    auto v_contig = v.contiguous();
+
+    at::Tensor k_packed_input = k_contig;
+    at::Tensor k_norm = at::empty({0}, k.options());
+
+    if (apply_hadamard || apply_norm) {
+        std::tie(k_packed_input, k_norm) = preprocess_k_cache_cuda(k_contig, apply_hadamard, apply_norm);
+    }
+
+    const auto batch_size = k_packed_input.size(0);
+    const auto seqlen_k = k_packed_input.size(1);
+    const auto num_heads = k_packed_input.size(2);
+    const auto head_dim = k_packed_input.size(3);
+
+    auto k_unpad = k_packed_input.reshape({batch_size * seqlen_k, num_heads, head_dim});
+    auto v_unpad = v_contig.reshape({batch_size * seqlen_k, num_heads, head_dim});
+
+    kvcache_qpack<num_bits>(
+        k_unpad,
+        k_pack,
+        k_params,
+        v_unpad,
+        v_pack,
+        v_params,
+        block_table_,
+        cu_seqlens_k,
+        max_seqlen_k,
+        quant_mode,
+        group_size
+    );
+
+    return k_norm;
+}
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "BitDecoding";
+    m.def("preprocess_k_cache", &preprocess_k_cache_cuda, "K cache preprocess with optional Hadamard and token-wise norm");
     m.def("kvcache_pack_int2", &kvcache_qpack<2>, "Forward pass, kvcache quantization and packing (2-bit)");
     m.def("kvcache_pack_int4", &kvcache_qpack<4>, "Forward pass, kvcache quantization and packing (4-bit)");
+    m.def("kvcache_pack_int2_preprocess_k", &kvcache_qpack_preprocess_k<2>, "Forward pass, K preprocess + kvcache quantization and packing (2-bit)");
+    m.def("kvcache_pack_int4_preprocess_k", &kvcache_qpack_preprocess_k<4>, "Forward pass, K preprocess + kvcache quantization and packing (4-bit)");
     m.def("fwd_kvcache_int2",  &mha_fwd_kvcache<2>, "Forward pass, with 2-bit KV-cache");
     m.def("fwd_kvcache_int4",  &mha_fwd_kvcache<4>, "Forward pass, with 4-bit KV-cache");
 }

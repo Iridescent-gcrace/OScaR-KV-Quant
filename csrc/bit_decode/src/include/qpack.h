@@ -117,8 +117,8 @@ struct qpack_kc_vt<2, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5> {
     CUTE_DEVICE static 
     void apply(Tensor1 &src, Tensor2 &dst, Tensor3 &scales_k, Tensor4 &zeros_k, Tensor5 &reduce_tmp, const int num_params) {
         const float max_val      = float((1 << num_bits) - 1);
-        const int pack_num       = 4 / (num_params / 2);                            // TODO: check 4
-        const int num_params_2   = size<1>(src) == 4 ? num_params / 2 : num_params; // TODO: change name? seems hard code? 
+        const int pack_num       = 4 / (num_params / 2);
+        const int num_params_2   = size<1>(src) == 4 ? num_params / 2 : num_params;
         const int channel_stride = size<0>(src);
 
         // Declare per-channel tensors
@@ -588,5 +588,3 @@ void pack_Vtensor_store(TiledCopyRS smem_tiled_copy, Tensor0 &src_r2s, Tensor1 &
 }
 
 } // namespace quant
-
-

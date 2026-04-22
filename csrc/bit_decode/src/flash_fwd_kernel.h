@@ -32,6 +32,41 @@ __forceinline__ __device__ void apply_softcap(Tensor<Engine, Layout> &tensor, co
     }
 }
 
+template <typename ElementNorm, typename Engine, typename Layout>
+__forceinline__ __device__ void apply_token_norm(
+    Tensor<Engine, Layout> &tensor_,
+    const ElementNorm *norm_ptr,
+    const int norm_row_stride,
+    const int col_idx_offset_,
+    const int max_seqlen_k
+) {
+    if (norm_ptr == nullptr) {
+        return;
+    }
+    static_assert(Layout::rank == 3, "Only support 3D Tensor");
+    static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
+
+    Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
+    const int lane_id = threadIdx.x % 32;
+    const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2 + (threadIdx.x / 32) * 8;
+
+    #pragma unroll
+    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+        const int col_idx_base = col_idx_offset + nj * 32;
+        #pragma unroll
+        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+            const int col_idx = col_idx_base + j;
+            if (col_idx < max_seqlen_k) {
+                const float token_norm = static_cast<float>(norm_ptr[col_idx * norm_row_stride]);
+                #pragma unroll
+                for (int mi = 0; mi < size<0>(tensor); ++mi) {
+                    tensor(mi, make_coord(j, nj)) *= token_norm;
+                }
+            }
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
@@ -70,7 +105,7 @@ inline __device__ void compute_attn_1rowblock_residualkv(const Params &params, c
     using ElementKVPack = typename Kernel_traits::ElementKVPack;
     using ElementAccum  = typename Kernel_traits::ElementAccum;
     using index_t       = typename Kernel_traits::index_t;
-    using SharedStorage = typename Kernel_traits::SharedStorage;
+    using SharedStorage = typename Kernel_traits::SharedStorage_residual;
     using Params2       = typename Kernel_traits::Params2;
 
     // Shared memory.
@@ -116,6 +151,9 @@ inline __device__ void compute_attn_1rowblock_residualkv(const Params &params, c
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
+    const Element *k_norm_new_ptr = params.k_norm_new_ptr == nullptr
+        ? nullptr
+        : reinterpret_cast<const Element *>(params.k_norm_new_ptr) + bidb * params.k_norm_new_batch_stride;
 
     // Tensor, global memory
 
@@ -419,6 +457,8 @@ inline __device__ void compute_attn_1rowblock_residualkv(const Params &params, c
                 );
             }
         }
+
+        apply_token_norm(acc_s, k_norm_new_ptr, params.k_norm_new_row_stride, 0, params.new_lens);
         
         // Mask
         mask_residual.template apply_mask<Is_causal, Is_even_MN>(
@@ -668,6 +708,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     #endif
 
     const int bidb_cache              = bidb;
+    const Element *packed_k_norm_ptr  = params.k_norm_ptr == nullptr
+        ? nullptr
+        : reinterpret_cast<const Element *>(params.k_norm_ptr)
+            + binfo.k_offset(params.k_norm_batch_stride, params.k_norm_row_stride, bidb);
     const int *block_table            = !Paged_KV ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
     const int block_table_idx         = !Paged_KV ? 0 : (n_block_max - 1) * kBlockN / params.page_block_size;
     const int block_table_offset      = !Paged_KV ? 0 : (n_block_max - 1) * kBlockN - block_table_idx * params.page_block_size;
@@ -917,14 +961,17 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     clear(tKsK_pack); 
     clear(tKsK_params);
 
-    const bool is_short_block   = num_bits == 4 && (binfo.actual_seqlen_k - n_block * kBlockN) % kBlockN < residual_block_size;
-    const int k_params_div = is_short_block && Kernel_traits::quant_mode == 1 ? group_size : 1;
+    const int packed_tokens_remaining = binfo.seqlen_k_cache - n_block * kBlockN;
+    const bool is_short_block = Kernel_traits::quant_mode == 1
+        && packed_tokens_remaining > 0
+        && packed_tokens_remaining < kBlockN;
+    const int k_params_div = is_short_block ? group_size : 1;
 
     flash::copy<Is_even_MN, Is_even_K>(
-        gmem_tiled_copy_k_pack, tKgK_pack, tKsK_pack, tKcK_pack, tKVpKV_pack, (binfo.seqlen_k_cache - n_block * kBlockN) / k_pack_div
+        gmem_tiled_copy_k_pack, tKgK_pack, tKsK_pack, tKcK_pack, tKVpKV_pack, packed_tokens_remaining / k_pack_div
     );
     flash::copy<Is_even_MN, Is_even_K>(
-        gmem_tiled_copy_k_params, tKgK_params, tKsK_params, tKcK_params, tKVpKV_params, (binfo.seqlen_k_cache - n_block * kBlockN) / k_params_div
+        gmem_tiled_copy_k_params, tKgK_params, tKsK_params, tKcK_params, tKVpKV_params, packed_tokens_remaining / k_params_div
     );
     cute::cp_async_fence();
 
@@ -1003,6 +1050,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             //     group_size
             // );
         }
+
+        apply_token_norm(acc_s, packed_k_norm_ptr, params.k_norm_row_stride, n_block * kBlockN, binfo.seqlen_k_cache);
 
         if constexpr (Is_softcap){
             apply_softcap(acc_s, params.softcap);
@@ -1129,6 +1178,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             //     group_size
             // );
         }
+
+        apply_token_norm(acc_s, packed_k_norm_ptr, params.k_norm_row_stride, n_block * kBlockN, binfo.seqlen_k_cache);
 
         if constexpr (Is_softcap){
             apply_softcap(acc_s, params.softcap);
