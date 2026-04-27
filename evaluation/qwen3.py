@@ -456,6 +456,29 @@ class Qwen3BitDecoding(Qwen3Attention):
         )
         return key_states.contiguous(), self._optional_cache_tensor(key_norm_states)
 
+    def _preprocess_query_states(
+        self,
+        query_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.kv_rotation != "hadamard":
+            return query_states.contiguous()
+
+        if (
+            not query_states.is_cuda
+            or query_states.dtype not in (torch.float16, torch.bfloat16)
+            or query_states.shape[-1] != 128
+        ):
+            raise NotImplementedError(
+                "Custom Qwen3 2-bit query Hadamard requires CUDA fp16/bf16 tensors with head_dim=128."
+            )
+
+        query_states, _ = preprocess_k_cache(
+            query_states,
+            apply_hadamard=True,
+            apply_norm=False,
+        )
+        return query_states.contiguous()
+
     def _pack_kv_cache_block(
         self,
         key_states: torch.Tensor,
@@ -539,8 +562,9 @@ class Qwen3BitDecoding(Qwen3Attention):
             # value_states already in correct format
             if use_custom_kv_transform:
                 logger.warning_once(
-                    "Using custom Qwen3 2-bit KV transform path: Hadamard/norm preprocessing with the existing 2-bit BitDecoding CUDA kernels."
+                    "Using custom Qwen3 2-bit KV transform path: query Hadamard plus key Hadamard/norm preprocessing with the existing 2-bit BitDecoding CUDA kernels."
                 )
+                query_states = self._preprocess_query_states(query_states)
                 key_states, key_norm_states = self._preprocess_key_cache_states(key_states)
                 value_states = value_states.contiguous()
             

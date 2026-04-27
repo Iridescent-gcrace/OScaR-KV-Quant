@@ -45,6 +45,7 @@ hf-models/
 pred/
 pred_e/
 logs/
+evaluation/results/
 
 *.so
 
