@@ -12,3 +12,5 @@
 template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 128, false, 1, 4, 128>(Flash_fwd_params &params, cudaStream_t stream);
 // template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 128, false, 1, 4, 64>(Flash_fwd_params &params, cudaStream_t stream);
 template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 128, false, 1, 4, 32>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false, 1, 4, 128>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false, 1, 4, 32>(Flash_fwd_params &params, cudaStream_t stream);

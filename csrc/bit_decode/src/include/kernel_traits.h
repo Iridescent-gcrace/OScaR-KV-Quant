@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include <type_traits>
+#include <cuda_bf16.h>
+
 #include "cute/tensor.hpp"
 
 #include "cutlass/cutlass.h"
@@ -60,6 +63,8 @@ struct Flash_fwd_kernel_traits : public Base {
     using ElementKVPack = cute::uint16_t;
     using ElementAccum = typename Base::ElementAccum;
     using index_t      = typename Base::index_t;
+    using Params2 = std::conditional_t<std::is_same_v<Element, cutlass::bfloat16_t>,
+                                       __nv_bfloat162, __half2>;
     
     using SmemCopyAtom = typename Base::SmemCopyAtom;
     using SmemCopyAtomTransposed = typename Base::SmemCopyAtomTransposed;
@@ -287,11 +292,11 @@ struct Flash_fwd_kernel_traits : public Base {
         // array_aligned<Element, cosize_v<SmemLayoutKV>> smem_K;
         // array_aligned<ElementKVPack, cosize_v<SmemLayoutKPack>> smem_Kpack;
         array_aligned<ElementKVPack, cosize_v<SmemLayoutKSize>> smem_Kpack;
-        array_aligned<__half2, cosize_v<SmemLayoutKParams>> smem_Kparams;
+        array_aligned<Params2, cosize_v<SmemLayoutKParams>> smem_Kparams;
         // array_aligned<Element, cosize_v<SmemLayoutKV>> smem_V;
         // array_aligned<ElementKVPack, cosize_v<SmemLayoutVPack>> smem_Vpack;
         array_aligned<ElementKVPack, cosize_v<SmemLayoutVSize>> smem_Vpack;
-        array_aligned<__half2, cosize_v<SmemLayoutVParams>> smem_Vparams;
+        array_aligned<Params2, cosize_v<SmemLayoutVParams>> smem_Vparams;
         array_aligned<Element, cosize_v<SmemLayoutAcc>> smem_acc;
     };
     static constexpr int kSmemSize = int(sizeof(SharedStorage));
@@ -303,7 +308,7 @@ struct Flash_fwd_kernel_traits : public Base {
         array_aligned<ElementKVPack, cosize_v<SmemLayoutKSize>> smem_Kpack;
         array_aligned<ElementKVPack, cosize_v<SmemLayoutVSize>> smem_Vpack;
         array_aligned<Element, cosize_v<SmemLayoutAcc>> smem_acc;
-        array_aligned<__half2, cosize_v<SmemLayoutKParams>> smem_Kparams;
+        array_aligned<Params2, cosize_v<SmemLayoutKParams>> smem_Kparams;
     };
     static constexpr int kSmemSize_res = int(sizeof(SharedStorage_residual));
 
@@ -359,11 +364,11 @@ struct Flash_fwd_kernel_traits : public Base {
 
     // KV params
     using GmemTileCopyKParams_BN128 = decltype(
-        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint32_t>, __half2>{},
+        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint32_t>, Params2>{},
                         make_layout(make_shape(_1{}, _128{}), make_stride(_1{}, _1{})),
                         Layout<Shape<_1, _1>>{}));  // Val layout, 4 vals per store
     using GmemTileCopyKParams_BN256 = decltype(
-        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint64_t>, __half2>{},
+        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint64_t>, Params2>{},
                         make_layout(make_shape(_1{}, _128{}), make_stride(_1{}, _1{})),
                         Layout<Shape<_2, _1>>{}));  // Val layout, 4 vals per store
     using GmemTileCopyKParams_channel = std::conditional_t<
@@ -373,11 +378,11 @@ struct Flash_fwd_kernel_traits : public Base {
     >;
 
     using GmemTileCopyVParams_BN128 = decltype(
-        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint32_t>, __half2>{},
+        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint32_t>, Params2>{},
                         make_layout(make_shape(_128{}, _1{}), make_stride(_1{}, _1{})),
                         Layout<Shape<_1, _1>>{}));  // Val layout, 4 vals per store
     using GmemTileCopyVParams_BN256 = decltype(
-        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint64_t>, __half2>{},
+        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint64_t>, Params2>{},
                         make_layout(make_shape(_128{}, _1{}), make_stride(_1{}, _1{})),
                         Layout<Shape<_2, _1>>{}));  // Val layout, 4 vals per store
     using GmemTileCopyVParams = std::conditional_t<
@@ -453,6 +458,8 @@ struct Flash_qpack_traits : public Base {
     using Element                = typename Base::Element;
     using ElementKVPack          = cute::uint16_t;
     using index_t                = typename Base::index_t;
+    using Params2 = std::conditional_t<std::is_same_v<Element, cutlass::bfloat16_t>,
+                                       __nv_bfloat162, __half2>;
     using SmemCopyAtom           = typename Base::SmemCopyAtom;
     using SmemCopyAtomTransposed = typename Base::SmemCopyAtomTransposed;
 

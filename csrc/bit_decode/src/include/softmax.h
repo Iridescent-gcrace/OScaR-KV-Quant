@@ -88,7 +88,9 @@ __device__ __forceinline__ void quad_allreduce_2(Tensor<Engine0, Layout0> &dst, 
         
         // Write the result to shared memory for each group's leader
         if (lane_id % 4 == 0) {
-            reduce_tmp(row,warp_id) = val;
+            auto &slot = reduce_tmp(row, warp_id);
+            using SlotType = cute::remove_cvref_t<decltype(slot)>;
+            slot = SlotType(val);
         }
         __syncthreads();
         
@@ -100,7 +102,9 @@ __device__ __forceinline__ void quad_allreduce_2(Tensor<Engine0, Layout0> &dst, 
             for (int w = 1; w < 4; w++) {
                 group_val = op(group_val, reduce_tmp(row, w));
             }
-            reduce_tmp(row, 0) = group_val;
+            auto &slot = reduce_tmp(row, 0);
+            using SlotType = cute::remove_cvref_t<decltype(slot)>;
+            slot = SlotType(group_val);
         }
         __syncthreads();
         

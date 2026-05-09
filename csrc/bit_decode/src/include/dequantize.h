@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cute/tensor.hpp>
+#include <cutlass/numeric_types.h>
 #include <cuda.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -28,6 +30,9 @@ struct Vec {
   __device__ T& operator[](int i) {
     return elems[i];
   }
+  __device__ const T& operator[](int i) const {
+    return elems[i];
+  }
 };
 
 
@@ -39,6 +44,68 @@ using FragA = Vec<half2, 4>;
 using FragB = Vec<half2, 8>;
 using FragC = Vec<float, 4>;
 using FragS = Vec<half2, 1>; // quantization scales
+
+using FragA_bf16 = Vec<__nv_bfloat162, 4>;
+using FragB_bf16 = Vec<__nv_bfloat162, 8>;
+
+template<typename Element>
+struct ParamsType {
+    using type = __half2;
+};
+
+template<>
+struct ParamsType<cutlass::bfloat16_t> {
+    using type = __nv_bfloat162;
+};
+
+template<typename T2>
+__device__ __forceinline__ T2 make_pair2(float val);
+
+template<>
+__device__ __forceinline__ __half2 make_pair2<__half2>(float val) {
+    return __half2half2(__float2half(val));
+}
+
+template<>
+__device__ __forceinline__ __nv_bfloat162 make_pair2<__nv_bfloat162>(float val) {
+    return __bfloat162bfloat162(__float2bfloat16(val));
+}
+
+template<typename T2>
+__device__ __forceinline__ Vec<T2, 4> convert_frag4(const FragA& frag);
+
+template<>
+__device__ __forceinline__ Vec<__half2, 4> convert_frag4<__half2>(const FragA& frag) {
+    return frag;
+}
+
+template<>
+__device__ __forceinline__ Vec<__nv_bfloat162, 4> convert_frag4<__nv_bfloat162>(const FragA& frag) {
+    Vec<__nv_bfloat162, 4> out;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        out[i] = __float22bfloat162_rn(__half22float2(frag[i]));
+    }
+    return out;
+}
+
+template<typename T2>
+__device__ __forceinline__ Vec<T2, 8> convert_frag8(const FragB& frag);
+
+template<>
+__device__ __forceinline__ Vec<__half2, 8> convert_frag8<__half2>(const FragB& frag) {
+    return frag;
+}
+
+template<>
+__device__ __forceinline__ Vec<__nv_bfloat162, 8> convert_frag8<__nv_bfloat162>(const FragB& frag) {
+    Vec<__nv_bfloat162, 8> out;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out[i] = __float22bfloat162_rn(__half22float2(frag[i]));
+    }
+    return out;
+}
 
 
 // Lookup-table based 3-input logical operation; explicitly used for dequantization as the compiler does not seem to
@@ -265,15 +332,15 @@ struct dequant_kc_vt<2, SourceEngine, SourceLayout, TargetEngine, TargetLayout, 
         using TQ  = cute::uint16_t;
         using TQ2 = cute::uint32_t;
         using T   = typename TargetEngine::value_type;
-        using T2  = __half2;
-        const int num_params_ = num_params / 2;                // TODO: only for g128
-        const int pack_num    = 4 / num_params_;               // TODO: check 4
+        using T2  = typename ParamsType<T>::type;
+        const int num_params_ = num_params / 2;
         
         // vectorize the source and target
         auto scales_vec  = cute::recast<T2>(scales);
         auto zeros_vec   = cute::recast<T2>(zeros);
         auto source_vec  = cute::recast<TQ2>(source);
         auto target_vec  = cute::recast<T2>(target);
+        const int pack_num = 4 / num_params_;
 
         const int channel_stride = size<0>(source_vec);
         
@@ -284,7 +351,7 @@ struct dequant_kc_vt<2, SourceEngine, SourceLayout, TargetEngine, TargetLayout, 
             for (int p = 0; p < cute::size<1>(source_vec); ++p) {
                 auto src_crd = cute::make_coord(i, p);
                 auto src_raw = source_vec(src_crd);
-                auto src_val = lop3_dequant_2bit(src_raw);
+                auto src_val = convert_frag8<T2>(lop3_dequant_2bit(src_raw));
 
                 CUTE_UNROLL
                 for (int j = 0; j < size<1>(target_vec); ++j) {
@@ -337,7 +404,7 @@ struct dequant_kc_vt<4, SourceEngine, SourceLayout, TargetEngine, TargetLayout, 
         using TQ  = cute::uint16_t;
         using TQ2 = cute::uint32_t;
         using T   = typename TargetEngine::value_type;
-        using T2  = __half2;
+        using T2  = typename ParamsType<T>::type;
         const int pack_num            = 4 / num_params;
         
         // vectorize the source and target
@@ -357,7 +424,7 @@ struct dequant_kc_vt<4, SourceEngine, SourceLayout, TargetEngine, TargetLayout, 
             {
                 auto src_crd = cute::make_coord(i, p);
                 auto src_raw = source_vec(src_crd);
-                auto src_val = lop3_dequant(src_raw);
+                auto src_val = convert_frag4<T2>(lop3_dequant(src_raw));
 
                 auto col_offset = p * num_bits;
 
@@ -417,7 +484,7 @@ dequantize_Ktensor(
     using TQ  = cute::uint16_t;
     using TQ2 = cute::uint32_t;
     using T   = typename TargetEngine::value_type;
-    using T2  = __half2;
+    using T2  = typename ParamsType<T>::type;
 
     static constexpr int kNumBits    = 4;
     const int num_params             = 128 / group_size;
@@ -438,7 +505,7 @@ dequantize_Ktensor(
         for (int p = 0; p < tile_j; ++p) {
             src_crd = tile_j == 1 ? cute::make_coord(i, 0, ii) : cute::make_coord(i, 0, 8 * (ii / 4) + ii % 4 + p * 4);
             auto src_raw = source_vec(src_crd);
-            auto src_val = lop3_dequant(src_raw);
+            auto src_val = convert_frag4<T2>(lop3_dequant(src_raw));
 
             auto col_offset = p * kNumBits;
 
@@ -447,16 +514,15 @@ dequantize_Ktensor(
             auto tgt2_crd      = cute::make_coord(i, col_offset + 2, ii);
             auto tgt3_crd      = cute::make_coord(i, col_offset + 3, ii);
 
-            // Create half2 values for scales and zeros
-            half2 scales_k_g_0 = __half2half2(__half(scales_k_g(ii / ki + col_offset * num_params + 0 * num_params)));
-            half2 scales_k_g_1 = __half2half2(__half(scales_k_g(ii / ki + col_offset * num_params + 1 * num_params)));
-            half2 scales_k_g_2 = __half2half2(__half(scales_k_g(ii / ki + col_offset * num_params + 2 * num_params)));
-            half2 scales_k_g_3 = __half2half2(__half(scales_k_g(ii / ki + col_offset * num_params + 3 * num_params)));
+            T2 scales_k_g_0 = make_pair2<T2>(float(scales_k_g(ii / ki + col_offset * num_params + 0 * num_params)));
+            T2 scales_k_g_1 = make_pair2<T2>(float(scales_k_g(ii / ki + col_offset * num_params + 1 * num_params)));
+            T2 scales_k_g_2 = make_pair2<T2>(float(scales_k_g(ii / ki + col_offset * num_params + 2 * num_params)));
+            T2 scales_k_g_3 = make_pair2<T2>(float(scales_k_g(ii / ki + col_offset * num_params + 3 * num_params)));
 
-            half2 zeros_k_g_0 = __half2half2(__half(zeros_k_g(ii / ki + col_offset * num_params + 0 * num_params)));
-            half2 zeros_k_g_1 = __half2half2(__half(zeros_k_g(ii / ki + col_offset * num_params + 1 * num_params)));
-            half2 zeros_k_g_2 = __half2half2(__half(zeros_k_g(ii / ki + col_offset * num_params + 2 * num_params)));
-            half2 zeros_k_g_3 = __half2half2(__half(zeros_k_g(ii / ki + col_offset * num_params + 3 * num_params)));
+            T2 zeros_k_g_0 = make_pair2<T2>(float(zeros_k_g(ii / ki + col_offset * num_params + 0 * num_params)));
+            T2 zeros_k_g_1 = make_pair2<T2>(float(zeros_k_g(ii / ki + col_offset * num_params + 1 * num_params)));
+            T2 zeros_k_g_2 = make_pair2<T2>(float(zeros_k_g(ii / ki + col_offset * num_params + 2 * num_params)));
+            T2 zeros_k_g_3 = make_pair2<T2>(float(zeros_k_g(ii / ki + col_offset * num_params + 3 * num_params)));
 
             target_vec(tgt0_crd) = __hfma2(src_val[0], scales_k_g_0, zeros_k_g_0);
             target_vec(tgt1_crd) = __hfma2(src_val[1], scales_k_g_1, zeros_k_g_1);

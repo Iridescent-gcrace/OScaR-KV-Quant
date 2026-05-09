@@ -32,6 +32,41 @@ __forceinline__ __device__ void apply_softcap(Tensor<Engine, Layout> &tensor, co
     }
 }
 
+template <typename ElementNorm, typename Engine, typename Layout>
+__forceinline__ __device__ void apply_token_norm(
+    Tensor<Engine, Layout> &tensor_,
+    const ElementNorm *norm_ptr,
+    const int norm_row_stride,
+    const int col_idx_offset_,
+    const int max_seqlen_k
+) {
+    if (norm_ptr == nullptr) {
+        return;
+    }
+    static_assert(Layout::rank == 3, "Only support 3D Tensor");
+    static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
+
+    Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
+    const int lane_id = threadIdx.x % 32;
+    const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2 + (threadIdx.x / 32) * 8;
+
+    #pragma unroll
+    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+        const int col_idx_base = col_idx_offset + nj * 32;
+        #pragma unroll
+        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+            const int col_idx = col_idx_base + j;
+            if (col_idx < max_seqlen_k) {
+                const float token_norm = static_cast<float>(norm_ptr[col_idx * norm_row_stride]);
+                #pragma unroll
+                for (int mi = 0; mi < size<0>(tensor); ++mi) {
+                    tensor(mi, make_coord(j, nj)) *= token_norm;
+                }
+            }
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
@@ -71,6 +106,7 @@ inline __device__ void compute_attn_1rowblock_residualkv(const Params &params, c
     using ElementAccum  = typename Kernel_traits::ElementAccum;
     using index_t       = typename Kernel_traits::index_t;
     using SharedStorage = typename Kernel_traits::SharedStorage_residual;
+    using Params2       = typename Kernel_traits::Params2;
 
     // Shared memory.
     extern __shared__ char smem_[];
@@ -115,6 +151,9 @@ inline __device__ void compute_attn_1rowblock_residualkv(const Params &params, c
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
+    const float *k_norm_new_ptr = params.k_norm_new_ptr == nullptr
+        ? nullptr
+        : reinterpret_cast<const float *>(params.k_norm_new_ptr) + bidb * params.k_norm_new_batch_stride;
 
     // Tensor, global memory
 
@@ -152,7 +191,7 @@ inline __device__ void compute_attn_1rowblock_residualkv(const Params &params, c
     Tensor gK_new_pack   = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKVPack*>(params.k_pack_new_ptr) + row_offset_knew_pack),
                                 Shape<Int<kBlockP_new_pack>, Int<kHeadDim_k>>{},
                                 make_stride(params.k_pack_new_row_stride, _1{}));
-    Tensor gK_new_params = make_tensor(make_gmem_ptr(reinterpret_cast<__half2*>(params.k_params_new_ptr) + row_offset_knew_params),
+    Tensor gK_new_params = make_tensor(make_gmem_ptr(reinterpret_cast<Params2*>(params.k_params_new_ptr) + row_offset_knew_params),
                                 Shape<Int<kBlockK_params_new>, Int<kHeadDim_k_params>>{},
                                 make_stride(params.k_params_new_row_stride, params.k_params_new_dim_stride));
 
@@ -162,7 +201,7 @@ inline __device__ void compute_attn_1rowblock_residualkv(const Params &params, c
     Tensor gV_new_pack   = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKVPack*>(params.v_pack_new_ptr) + row_offset_vnew_pack),
                                 Shape<Int<kBlockN_pack>, Int<kHeadDim_pack>>{},
                                 make_stride(params.v_pack_new_row_stride, _1{}));
-    Tensor gV_new_params = make_tensor(make_gmem_ptr(reinterpret_cast<__half2*>(params.v_params_new_ptr) + row_offset_vnew_params),
+    Tensor gV_new_params = make_tensor(make_gmem_ptr(reinterpret_cast<Params2*>(params.v_params_new_ptr) + row_offset_vnew_params),
                                 Shape<Int<kBlockN_pack>, Int<kHeadDim_v_params>>{},
                                 make_stride(params.v_params_new_row_stride, params.v_params_new_dim_stride));
 
@@ -223,12 +262,12 @@ inline __device__ void compute_attn_1rowblock_residualkv(const Params &params, c
     // Tensor, quantization params
     //
 
-    using TensorParamsKC          = decltype(make_tensor<half_t>(make_shape(Int<4 * num_params>{}, Int<tile_paramsk_m>{}, Int<tile_paramsk_k>{})));
-    using TensorParamsVG          = decltype(make_tensor<half_t>(make_shape(Int<num_bits * num_params>{}, Int<tile_paramsv_k>{})));
-    using TensorParamsG           = decltype(make_tensor<half_t>(make_shape(Int<tile_paramsk_g>{})));
-    using TensorParamsKC_residual = decltype(make_tensor<half_t>(make_shape(Int<4 * num_params>{}, Int<tile_paramsk_k>{})));
-    using TensorParamsKT_residual = decltype(make_tensor<half_t>(make_shape(Int<tile_paramsk_g_r>{})));
-    using TensorParamsVT_residual = decltype(make_tensor<half_t>(make_shape(Int<num_bits * num_params>{}, Int<tile_paramsv_k_r>{})));
+    using TensorParamsKC          = decltype(make_tensor<Element>(make_shape(Int<4 * num_params>{}, Int<tile_paramsk_m>{}, Int<tile_paramsk_k>{})));
+    using TensorParamsVG          = decltype(make_tensor<Element>(make_shape(Int<num_bits * num_params>{}, Int<tile_paramsv_k>{})));
+    using TensorParamsG           = decltype(make_tensor<Element>(make_shape(Int<tile_paramsk_g>{})));
+    using TensorParamsKC_residual = decltype(make_tensor<Element>(make_shape(Int<4 * num_params>{}, Int<tile_paramsk_k>{})));
+    using TensorParamsKT_residual = decltype(make_tensor<Element>(make_shape(Int<tile_paramsk_g_r>{})));
+    using TensorParamsVT_residual = decltype(make_tensor<Element>(make_shape(Int<num_bits * num_params>{}, Int<tile_paramsv_k_r>{})));
     
     TensorParamsKC tScales_k_c, tZeros_k_c;
     TensorParamsVG tScales_v_c, tZeros_v_c;
@@ -237,19 +276,19 @@ inline __device__ void compute_attn_1rowblock_residualkv(const Params &params, c
     TensorParamsKT_residual tScales_k_tr, tZeros_k_tr;
     TensorParamsVT_residual tScales_v_tr, tZeros_v_tr;
 
-    auto tScales_k_h2_c  = cute::recast<__half2>(tScales_k_c);
-    auto tZeros_k_h2_c   = cute::recast<__half2>(tZeros_k_c);
-    auto tScales_k_h2_g  = cute::recast<__half2>(tScales_k_g);
-    auto tZeros_k_h2_g   = cute::recast<__half2>(tZeros_k_g);
-    auto tScales_k_h2_cr = cute::recast<__half2>(tScales_k_cr);
-    auto tZeros_k_h2_cr  = cute::recast<__half2>(tZeros_k_cr);
-    auto tScales_k_h2_tr = cute::recast<__half2>(tScales_k_tr);
-    auto tZeros_k_h2_tr  = cute::recast<__half2>(tZeros_k_tr);
+    auto tScales_k_h2_c  = cute::recast<Params2>(tScales_k_c);
+    auto tZeros_k_h2_c   = cute::recast<Params2>(tZeros_k_c);
+    auto tScales_k_h2_g  = cute::recast<Params2>(tScales_k_g);
+    auto tZeros_k_h2_g   = cute::recast<Params2>(tZeros_k_g);
+    auto tScales_k_h2_cr = cute::recast<Params2>(tScales_k_cr);
+    auto tZeros_k_h2_cr  = cute::recast<Params2>(tZeros_k_cr);
+    auto tScales_k_h2_tr = cute::recast<Params2>(tScales_k_tr);
+    auto tZeros_k_h2_tr  = cute::recast<Params2>(tZeros_k_tr);
 
-    auto tScales_v_h2    = cute::recast<__half2>(tScales_v_c);
-    auto tZeros_v_h2     = cute::recast<__half2>(tZeros_v_c);
-    auto tScales_v_h2_tr = cute::recast<__half2>(tScales_v_tr);
-    auto tZeros_v_h2_tr  = cute::recast<__half2>(tZeros_v_tr);
+    auto tScales_v_h2    = cute::recast<Params2>(tScales_v_c);
+    auto tZeros_v_h2     = cute::recast<Params2>(tZeros_v_c);
+    auto tScales_v_h2_tr = cute::recast<Params2>(tScales_v_tr);
+    auto tZeros_v_h2_tr  = cute::recast<Params2>(tZeros_v_tr);
 
     //
     // MMA Atom partitioning
@@ -418,6 +457,8 @@ inline __device__ void compute_attn_1rowblock_residualkv(const Params &params, c
                 );
             }
         }
+
+        apply_token_norm(acc_s, k_norm_new_ptr, params.k_norm_new_row_stride, 0, params.new_lens);
         
         // Mask
         mask_residual.template apply_mask<Is_causal, Is_even_MN>(
@@ -566,6 +607,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     using ElementAccum  = typename Kernel_traits::ElementAccum;
     using index_t       = typename Kernel_traits::index_t;
     using SharedStorage = typename Kernel_traits::SharedStorage;
+    using Params2       = typename Kernel_traits::Params2;
 
     // Shared memory.
     extern __shared__ char smem_[];
@@ -666,6 +708,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     #endif
 
     const int bidb_cache              = bidb;
+    const float *packed_k_norm_ptr  = params.k_norm_ptr == nullptr
+        ? nullptr
+        : reinterpret_cast<const float *>(params.k_norm_ptr)
+            + binfo.k_offset(params.k_norm_batch_stride, params.k_norm_row_stride, bidb);
     const int *block_table            = !Paged_KV ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
     const int block_table_idx         = !Paged_KV ? 0 : (n_block_max - 1) * kBlockN / params.page_block_size;
     const int block_table_offset      = !Paged_KV ? 0 : (n_block_max - 1) * kBlockN - block_table_idx * params.page_block_size;
@@ -705,14 +751,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor gK_pack   = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKVPack*>(params.K_pack_ptr) + row_offset_k_pack),
                             Shape<Int<kBlockP>, Int<kHeadDim_k>>{},
                             make_stride(params.K_pack_row_stride, _1{}));
-    Tensor gK_params = make_tensor(make_gmem_ptr(reinterpret_cast<__half2*>(params.k_params_ptr) + row_offset_k_params),
+    Tensor gK_params = make_tensor(make_gmem_ptr(reinterpret_cast<Params2*>(params.k_params_ptr) + row_offset_k_params),
                            Shape<Int<kBlockK_params>, Int<kHeadDim_k_params>>{},
                            make_stride(params.k_params_row_stride, _1{}));
 
     Tensor gV_pack   = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKVPack*>(params.v_pack_ptr) + row_offset_v_pack),
                            Shape<Int<kBlockN>, Int<kHeadDim_pack>>{},
                            make_stride(params.v_pack_row_stride, _1{}));
-    Tensor gV_params = make_tensor(make_gmem_ptr(reinterpret_cast<__half2*>(params.v_params_ptr) + row_offset_v_params),
+    Tensor gV_params = make_tensor(make_gmem_ptr(reinterpret_cast<Params2*>(params.v_params_ptr) + row_offset_v_params),
                            Shape<Int<kBlockN>, Int<kHeadDim_v_params>>{},
                            make_stride(_1{}, params.v_params_dim_stride));
 
@@ -773,12 +819,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // Tensor, quantization params
     //
 
-    using TensorParamsKC          = decltype(make_tensor<half_t>(make_shape(Int<4 * num_params>{}, Int<tile_paramsk_m>{}, Int<tile_paramsk_k>{})));
-    using TensorParamsVG          = decltype(make_tensor<half_t>(make_shape(Int<num_bits * num_params>{}, Int<tile_paramsv_k>{})));
-    using TensorParamsG           = decltype(make_tensor<half_t>(make_shape(Int<tile_paramsk_g>{})));
-    using TensorParamsKC_residual = decltype(make_tensor<half_t>(make_shape(Int<4 * num_params>{}, Int<tile_paramsk_k>{})));
-    using TensorParamsKT_residual = decltype(make_tensor<half_t>(make_shape(Int<tile_paramsk_g_r>{})));
-    using TensorParamsVT_residual = decltype(make_tensor<half_t>(make_shape(Int<num_bits * num_params>{}, Int<tile_paramsv_k_r>{})));
+    using TensorParamsKC          = decltype(make_tensor<Element>(make_shape(Int<4 * num_params>{}, Int<tile_paramsk_m>{}, Int<tile_paramsk_k>{})));
+    using TensorParamsVG          = decltype(make_tensor<Element>(make_shape(Int<num_bits * num_params>{}, Int<tile_paramsv_k>{})));
+    using TensorParamsG           = decltype(make_tensor<Element>(make_shape(Int<tile_paramsk_g>{})));
+    using TensorParamsKC_residual = decltype(make_tensor<Element>(make_shape(Int<4 * num_params>{}, Int<tile_paramsk_k>{})));
+    using TensorParamsKT_residual = decltype(make_tensor<Element>(make_shape(Int<tile_paramsk_g_r>{})));
+    using TensorParamsVT_residual = decltype(make_tensor<Element>(make_shape(Int<num_bits * num_params>{}, Int<tile_paramsv_k_r>{})));
     
     TensorParamsKC tScales_k_c, tZeros_k_c;
     TensorParamsVG tScales_v_c, tZeros_v_c;
@@ -787,19 +833,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     TensorParamsKT_residual tScales_k_tr, tZeros_k_tr;
     TensorParamsVT_residual tScales_v_tr, tZeros_v_tr;
 
-    auto tScales_k_h2_c  = cute::recast<__half2>(tScales_k_c);
-    auto tZeros_k_h2_c   = cute::recast<__half2>(tZeros_k_c);
-    auto tScales_k_h2_g  = cute::recast<__half2>(tScales_k_g);
-    auto tZeros_k_h2_g   = cute::recast<__half2>(tZeros_k_g);
-    auto tScales_k_h2_cr = cute::recast<__half2>(tScales_k_cr);
-    auto tZeros_k_h2_cr  = cute::recast<__half2>(tZeros_k_cr);
-    auto tScales_k_h2_tr = cute::recast<__half2>(tScales_k_tr);
-    auto tZeros_k_h2_tr  = cute::recast<__half2>(tZeros_k_tr);
+    auto tScales_k_h2_c  = cute::recast<Params2>(tScales_k_c);
+    auto tZeros_k_h2_c   = cute::recast<Params2>(tZeros_k_c);
+    auto tScales_k_h2_g  = cute::recast<Params2>(tScales_k_g);
+    auto tZeros_k_h2_g   = cute::recast<Params2>(tZeros_k_g);
+    auto tScales_k_h2_cr = cute::recast<Params2>(tScales_k_cr);
+    auto tZeros_k_h2_cr  = cute::recast<Params2>(tZeros_k_cr);
+    auto tScales_k_h2_tr = cute::recast<Params2>(tScales_k_tr);
+    auto tZeros_k_h2_tr  = cute::recast<Params2>(tZeros_k_tr);
 
-    auto tScales_v_h2    = cute::recast<__half2>(tScales_v_c);
-    auto tZeros_v_h2     = cute::recast<__half2>(tZeros_v_c);
-    auto tScales_v_h2_tr = cute::recast<__half2>(tScales_v_tr);
-    auto tZeros_v_h2_tr  = cute::recast<__half2>(tZeros_v_tr);
+    auto tScales_v_h2    = cute::recast<Params2>(tScales_v_c);
+    auto tZeros_v_h2     = cute::recast<Params2>(tZeros_v_c);
+    auto tScales_v_h2_tr = cute::recast<Params2>(tScales_v_tr);
+    auto tZeros_v_h2_tr  = cute::recast<Params2>(tZeros_v_tr);
 
     //
     // MMA Atom partitioning
@@ -1002,6 +1048,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             // );
         }
 
+        apply_token_norm(acc_s, packed_k_norm_ptr, params.k_norm_row_stride, n_block * kBlockN, binfo.seqlen_k_cache);
+
         if constexpr (Is_softcap){
             apply_softcap(acc_s, params.softcap);
         }
@@ -1127,6 +1175,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             //     group_size
             // );
         }
+
+        apply_token_norm(acc_s, packed_k_norm_ptr, params.k_norm_row_stride, n_block * kBlockN, binfo.seqlen_k_cache);
 
         if constexpr (Is_softcap){
             apply_softcap(acc_s, params.softcap);
@@ -1276,6 +1326,7 @@ inline __device__ void compute_qpack_1rowblock(const Params &params, const int b
     using ElementKVPack = typename Kernel_traits::ElementKVPack;
     using SharedStorage = typename Kernel_traits::SharedStorage;
     using index_t       = typename Kernel_traits::index_t;
+    using Params2       = typename Kernel_traits::Params2;
 
     // Shared memory.
     extern __shared__ char smem_[];
@@ -1338,7 +1389,7 @@ inline __device__ void compute_qpack_1rowblock(const Params &params, const int b
     Tensor gK_pack      = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKVPack*>(params.K_pack_ptr) + row_offset_k_pack),
                            Shape<Int<kBlockP>, Int<kHeadDim_k>>{},
                            make_stride(params.K_pack_row_stride, _1{}));
-    Tensor gK_params    = make_tensor(make_gmem_ptr(reinterpret_cast<__half2*>(params.k_params_ptr) + row_offset_k_params),
+    Tensor gK_params    = make_tensor(make_gmem_ptr(reinterpret_cast<Params2*>(params.k_params_ptr) + row_offset_k_params),
                            Shape<Int<kBlockK_params>, Int<kHeadDim_k_params>>{},
                            make_stride(params.k_params_row_stride, params.k_params_dim_stride));
 
@@ -1348,7 +1399,7 @@ inline __device__ void compute_qpack_1rowblock(const Params &params, const int b
     Tensor gV_pack      = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKVPack*>(params.v_pack_ptr) + row_offset_v_pack),
                            Shape<Int<kBlockN>, Int<kHeadDim_pack>>{},
                            make_stride(params.v_pack_row_stride, _1{}));
-    Tensor gV_params    = make_tensor(make_gmem_ptr(reinterpret_cast<__half2*>(params.v_params_ptr) + row_offset_v_params),
+    Tensor gV_params    = make_tensor(make_gmem_ptr(reinterpret_cast<Params2*>(params.v_params_ptr) + row_offset_v_params),
                            Shape<Int<kBlockN>, Int<kHeadDim_v_params>>{},
                            make_stride(params.v_params_row_stride, params.v_params_dim_stride));
 
@@ -1448,9 +1499,9 @@ inline __device__ void compute_qpack_1rowblock(const Params &params, const int b
     cute::copy(smem_tiled_copy_K, tSsK, tSrK_view);
 
     // quantize kv
-    using TensorParamsKC = decltype(make_tensor<half_t>(make_shape(Int<4 * num_params>{}, Int<tile_paramsk_k>{})));
-    using TensorParamsVG = decltype(make_tensor<half_t>(make_shape(Int<num_bits * num_params>{}, Int<tile_paramsv_k>{}))); // TODO: need to change, hardcode num_bits
-    using TensorParamsG  = decltype(make_tensor<half_t>(make_shape(Int<tile_paramsk_g>{})));
+    using TensorParamsKC = decltype(make_tensor<Element>(make_shape(Int<4 * num_params>{}, Int<tile_paramsk_k>{})));
+    using TensorParamsVG = decltype(make_tensor<Element>(make_shape(Int<num_bits * num_params>{}, Int<tile_paramsv_k>{})));
+    using TensorParamsG  = decltype(make_tensor<Element>(make_shape(Int<tile_paramsk_g>{})));
     
     TensorParamsKC tScales_k_c, tZeros_k_c;
     TensorParamsVG tScales_v_c, tZeros_v_c;
@@ -1462,13 +1513,13 @@ inline __device__ void compute_qpack_1rowblock(const Params &params, const int b
         quant::quant_Ktensor(tSrK, tSrK_pack, tScales_k_g, tZeros_k_g, num_params);
     }
     
-    auto tScales_k_h2_c = cute::recast<__half2>(tScales_k_c);
-    auto tZeros_k_h2_c  = cute::recast<__half2>(tZeros_k_c);
-    auto tScales_k_h2_g = cute::recast<__half2>(tScales_k_g);
-    auto tZeros_k_h2_g  = cute::recast<__half2>(tZeros_k_g);
+    auto tScales_k_h2_c = cute::recast<Params2>(tScales_k_c);
+    auto tZeros_k_h2_c  = cute::recast<Params2>(tZeros_k_c);
+    auto tScales_k_h2_g = cute::recast<Params2>(tScales_k_g);
+    auto tZeros_k_h2_g  = cute::recast<Params2>(tZeros_k_g);
 
-    auto tScales_v_h2   = cute::recast<__half2>(tScales_v_c);
-    auto tZeros_v_h2    = cute::recast<__half2>(tZeros_v_c);
+    auto tScales_v_h2   = cute::recast<Params2>(tScales_v_c);
+    auto tZeros_v_h2    = cute::recast<Params2>(tZeros_v_c);
 
     flash::cp_async_wait<0>();                               
     __syncthreads();

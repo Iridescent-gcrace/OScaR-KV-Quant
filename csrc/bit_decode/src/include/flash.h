@@ -31,6 +31,8 @@ struct Qkv_params {
     void *__restrict__ k_pack_new_ptr;
     void *__restrict__ k_params_new_ptr;
     void *__restrict__ k_params_ptr;
+    void *__restrict__ k_norm_ptr;
+    void *__restrict__ k_norm_new_ptr;
     void *__restrict__ v_ptr;
     void *__restrict__ v_pack_ptr;
     void *__restrict__ v_pack_new_ptr;
@@ -45,6 +47,8 @@ struct Qkv_params {
     index_t k_pack_new_batch_stride;
     index_t k_params_batch_stride;
     index_t k_params_new_batch_stride;
+    index_t k_norm_batch_stride;
+    index_t k_norm_new_batch_stride;
 
     index_t v_batch_stride;
     index_t v_pack_batch_stride;
@@ -59,6 +63,8 @@ struct Qkv_params {
     index_t k_pack_new_row_stride;
     index_t k_params_row_stride;
     index_t k_params_new_row_stride;
+    index_t k_norm_row_stride;
+    index_t k_norm_new_row_stride;
 
     index_t v_row_stride;
     index_t v_pack_row_stride;
@@ -203,4 +209,3 @@ struct Flash_fwd_params : public Qkv_params {
 template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 template<typename T, int Headdim, bool Is_causal, int quant_mode, int num_bits, int group_size> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
 template<typename T, int Headdim, int quant_mode, int num_bits, int group_size> void run_kvcache_qpack_(Flash_fwd_params &params, cudaStream_t stream);
-
