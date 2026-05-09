@@ -182,14 +182,28 @@ Notes:
 
 ## Remote Push Commands
 
-The intended push targets for the current branch are:
+Push commands executed from `/home/yangrui55/BitDecoding`:
 
 ```bash
 git push iridescent HEAD:Iridescent-gcrace/2bit-preprocess-r256
 git push origin HEAD:Iridescent-gcrace/2bit-preprocess-r256
+git push origin HEAD:e2e
 git push sankuai HEAD:Iridescent-gcrace/2bit-preprocess-r256
 git push sankuai HEAD:yang/bitdecoding-e2e-tc128-hada128
 ```
 
-Use only normal fast-forward pushes. Do not force-push unless the branch owner
-explicitly requests it.
+Push results on 2026-05-10:
+
+- `iridescent HEAD:Iridescent-gcrace/2bit-preprocess-r256`: succeeded; new branch created.
+- `origin HEAD:Iridescent-gcrace/2bit-preprocess-r256`: failed because `origin` uses HTTPS and no GitHub username / credential was available in this environment.
+- `origin HEAD:e2e`: failed for the same HTTPS credential reason.
+- `sankuai HEAD:Iridescent-gcrace/2bit-preprocess-r256`: succeeded; new branch created.
+- `sankuai HEAD:yang/bitdecoding-e2e-tc128-hada128`: succeeded; fast-forwarded from `4d85fce` to the current head.
+
+Branches intentionally not overwritten:
+
+- `iridescent/BitDecoding-e2e`: not fast-forwardable to the current head.
+- `iridescent/Iridescent-gcrace/2bit-residual-github`: not fast-forwardable to the current head.
+- `sankuai/yang/bitdecoding-e2e-2bit`: not fast-forwardable to the current head.
+
+Use only normal fast-forward pushes. Do not force-push unless the branch owner explicitly requests it.
