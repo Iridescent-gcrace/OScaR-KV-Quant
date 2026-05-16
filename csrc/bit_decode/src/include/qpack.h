@@ -8,6 +8,31 @@ namespace quant {
 
 using namespace cute;
 
+__device__ __forceinline__ void compute_affine_asym_params(
+    float min_i,
+    float max_i,
+    float max_val,
+    float &scale_inv,
+    float &zero_q,
+    float &zero_dequant
+) {
+    if (min_i == 0.0f && max_i == 0.0f) {
+        min_i = -1.0f;
+        max_i = 1.0f;
+    }
+    const float range = max_i - min_i;
+    if (range > 0.0f) {
+        const float scale = range / max_val;
+        scale_inv = max_val / range;
+        zero_q = nearbyintf(-min_i / scale);
+        zero_dequant = -zero_q * scale;
+    } else {
+        scale_inv = 0.0f;
+        zero_q = 0.0f;
+        zero_dequant = min_i;
+    }
+}
+
 template<typename Tensor0, typename Tensor1, typename Operator>
 CUTE_DEVICE
 void thread_reduce_(Tensor0 const& tensor, Tensor1& summary, Operator& op, const int num_params) {
@@ -117,13 +142,13 @@ struct qpack_kc_vt<2, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5> {
     CUTE_DEVICE static 
     void apply(Tensor1 &src, Tensor2 &dst, Tensor3 &scales_k, Tensor4 &zeros_k, Tensor5 &reduce_tmp, const int num_params) {
         const float max_val      = float((1 << num_bits) - 1);
-        const int pack_num       = 4 / (num_params / 2);
-        const int num_params_2   = size<1>(src) == 4 ? num_params / 2 : num_params;
+        const int num_params_2   = size<1>(src) == 4 && num_params > 1 ? num_params / 2 : num_params;
+        const int pack_num       = size<1>(src) / num_params_2;
         const int channel_stride = size<0>(src);
 
         // Declare per-channel tensors
         using TensorChannel = decltype(make_fragment_like<float>(scales_k(_, 0)));
-        TensorChannel channel_max, channel_min, channel_range, channel_scales_inv, channel_zeros;
+        TensorChannel channel_max, channel_min, channel_range, channel_scales_inv, channel_zeros, channel_zero_q;
 
         CUTE_UNROLL
         for (int k = 0; k < size<2>(src); ++k) {
@@ -136,11 +161,13 @@ struct qpack_kc_vt<2, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5> {
             for (int i = 0; i < size(channel_max); ++i) {
                 float max_i = float(channel_max(i));
                 float min_i = float(channel_min(i));
-                float range = max_i - min_i;
-                // Avoid division by zero
-                float scale_inv = (range > 0.0f) ? (max_val / range) : 0.0f;
+                float scale_inv = 0.0f;
+                float zero_q = 0.0f;
+                float zero_dequant = 0.0f;
+                compute_affine_asym_params(min_i, max_i, max_val, scale_inv, zero_q, zero_dequant);
                 channel_scales_inv(i) = scale_inv;
-                channel_zeros(i) = min_i;
+                channel_zero_q(i) = zero_q;
+                channel_zeros(i) = zero_dequant;
                 // Store scales and zeros
                 {
                     auto &s_slot = scales_k(i, k);
@@ -150,7 +177,7 @@ struct qpack_kc_vt<2, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5> {
                 {
                     auto &z_slot = zeros_k(i, k);
                     using ZT = cute::remove_cvref_t<decltype(z_slot)>;
-                    z_slot = ZT(min_i);
+                    z_slot = ZT(zero_dequant);
                 }
             }
 
@@ -170,34 +197,34 @@ struct qpack_kc_vt<2, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5> {
                     // float val7 = float(src(i, jj + 7, k));
 
                     // Load 4 values and convert to float
-                    float val0 = float(src(i, jj,     k)) - channel_zeros(i + (jj    ) / pack_num * channel_stride);
-                    float val1 = float(src(i, jj + 1, k)) - channel_zeros(i + (jj + 1) / pack_num * channel_stride);
-                    float val2 = float(src(i, jj + 2, k)) - channel_zeros(i + (jj + 2) / pack_num * channel_stride);
-                    float val3 = float(src(i, jj + 3, k)) - channel_zeros(i + (jj + 3) / pack_num * channel_stride);
-                    float val4 = float(src(i, jj + 4, k)) - channel_zeros(i + (jj + 4) / pack_num * channel_stride);
-                    float val5 = float(src(i, jj + 5, k)) - channel_zeros(i + (jj + 5) / pack_num * channel_stride);
-                    float val6 = float(src(i, jj + 6, k)) - channel_zeros(i + (jj + 6) / pack_num * channel_stride);
-                    float val7 = float(src(i, jj + 7, k)) - channel_zeros(i + (jj + 7) / pack_num * channel_stride);
+                    float val0 = float(src(i, jj,     k));
+                    float val1 = float(src(i, jj + 1, k));
+                    float val2 = float(src(i, jj + 2, k));
+                    float val3 = float(src(i, jj + 3, k));
+                    float val4 = float(src(i, jj + 4, k));
+                    float val5 = float(src(i, jj + 5, k));
+                    float val6 = float(src(i, jj + 6, k));
+                    float val7 = float(src(i, jj + 7, k));
 
                     // Apply scale inverses
-                    val0 *= channel_scales_inv(i + (jj    ) / pack_num * channel_stride);
-                    val1 *= channel_scales_inv(i + (jj + 1) / pack_num * channel_stride);
-                    val2 *= channel_scales_inv(i + (jj + 2) / pack_num * channel_stride);
-                    val3 *= channel_scales_inv(i + (jj + 3) / pack_num * channel_stride);
-                    val4 *= channel_scales_inv(i + (jj + 4) / pack_num * channel_stride);
-                    val5 *= channel_scales_inv(i + (jj + 5) / pack_num * channel_stride);
-                    val6 *= channel_scales_inv(i + (jj + 6) / pack_num * channel_stride);
-                    val7 *= channel_scales_inv(i + (jj + 7) / pack_num * channel_stride);
+                    val0 = val0 * channel_scales_inv(i + (jj    ) / pack_num * channel_stride) + channel_zero_q(i + (jj    ) / pack_num * channel_stride);
+                    val1 = val1 * channel_scales_inv(i + (jj + 1) / pack_num * channel_stride) + channel_zero_q(i + (jj + 1) / pack_num * channel_stride);
+                    val2 = val2 * channel_scales_inv(i + (jj + 2) / pack_num * channel_stride) + channel_zero_q(i + (jj + 2) / pack_num * channel_stride);
+                    val3 = val3 * channel_scales_inv(i + (jj + 3) / pack_num * channel_stride) + channel_zero_q(i + (jj + 3) / pack_num * channel_stride);
+                    val4 = val4 * channel_scales_inv(i + (jj + 4) / pack_num * channel_stride) + channel_zero_q(i + (jj + 4) / pack_num * channel_stride);
+                    val5 = val5 * channel_scales_inv(i + (jj + 5) / pack_num * channel_stride) + channel_zero_q(i + (jj + 5) / pack_num * channel_stride);
+                    val6 = val6 * channel_scales_inv(i + (jj + 6) / pack_num * channel_stride) + channel_zero_q(i + (jj + 6) / pack_num * channel_stride);
+                    val7 = val7 * channel_scales_inv(i + (jj + 7) / pack_num * channel_stride) + channel_zero_q(i + (jj + 7) / pack_num * channel_stride);
 
                     // Round and clamp the values
-                    val0 = fminf(fmaxf(roundf(val0), 0.0f), max_val);
-                    val1 = fminf(fmaxf(roundf(val1), 0.0f), max_val);
-                    val2 = fminf(fmaxf(roundf(val2), 0.0f), max_val);
-                    val3 = fminf(fmaxf(roundf(val3), 0.0f), max_val);
-                    val4 = fminf(fmaxf(roundf(val4), 0.0f), max_val);
-                    val5 = fminf(fmaxf(roundf(val5), 0.0f), max_val);
-                    val6 = fminf(fmaxf(roundf(val6), 0.0f), max_val);
-                    val7 = fminf(fmaxf(roundf(val7), 0.0f), max_val);
+                    val0 = fminf(fmaxf(nearbyintf(val0), 0.0f), max_val);
+                    val1 = fminf(fmaxf(nearbyintf(val1), 0.0f), max_val);
+                    val2 = fminf(fmaxf(nearbyintf(val2), 0.0f), max_val);
+                    val3 = fminf(fmaxf(nearbyintf(val3), 0.0f), max_val);
+                    val4 = fminf(fmaxf(nearbyintf(val4), 0.0f), max_val);
+                    val5 = fminf(fmaxf(nearbyintf(val5), 0.0f), max_val);
+                    val6 = fminf(fmaxf(nearbyintf(val6), 0.0f), max_val);
+                    val7 = fminf(fmaxf(nearbyintf(val7), 0.0f), max_val);
 
                     // Pack 8 values (2-bit each) into a 16-bit integer
                     uint16_t packed = 0;
@@ -239,7 +266,7 @@ struct qpack_kc_vt<4, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5> {
 
         // Declare per-channel tensors
         using TensorChannel = decltype(make_fragment_like<float>(scales_k(_, 0)));
-        TensorChannel channel_max, channel_min, channel_range, channel_scales_inv, channel_zeros;
+        TensorChannel channel_max, channel_min, channel_range, channel_scales_inv, channel_zeros, channel_zero_q;
         
 
         CUTE_UNROLL
@@ -253,11 +280,13 @@ struct qpack_kc_vt<4, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5> {
             for (int i = 0; i < size(channel_max); ++i) {
                 float max_i = float(channel_max(i));
                 float min_i = float(channel_min(i));
-                float range = max_i - min_i;
-                // Avoid division by zero
-                float scale_inv = (range > 0.0f) ? (max_val / range) : 0.0f;
+                float scale_inv = 0.0f;
+                float zero_q = 0.0f;
+                float zero_dequant = 0.0f;
+                compute_affine_asym_params(min_i, max_i, max_val, scale_inv, zero_q, zero_dequant);
                 channel_scales_inv(i) = scale_inv;
-                channel_zeros(i) = min_i;
+                channel_zero_q(i) = zero_q;
+                channel_zeros(i) = zero_dequant;
                 // Store scales and zeros
                 {
                     auto &s_slot = scales_k(i, k);
@@ -267,7 +296,7 @@ struct qpack_kc_vt<4, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5> {
                 {
                     auto &z_slot = zeros_k(i, k);
                     using ZT = cute::remove_cvref_t<decltype(z_slot)>;
-                    z_slot = ZT(min_i);
+                    z_slot = ZT(zero_dequant);
                 }
             }
 
@@ -283,22 +312,22 @@ struct qpack_kc_vt<4, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5> {
                     // float val3 = float(src(i, jj + 3, k));
 
                     // Load 4 values and convert to float
-                    float val0 = float(src(i, jj,     k)) - channel_zeros(i + (jj    ) / pack_num * channel_stride);
-                    float val1 = float(src(i, jj + 1, k)) - channel_zeros(i + (jj + 1) / pack_num * channel_stride);
-                    float val2 = float(src(i, jj + 2, k)) - channel_zeros(i + (jj + 2) / pack_num * channel_stride);
-                    float val3 = float(src(i, jj + 3, k)) - channel_zeros(i + (jj + 3) / pack_num * channel_stride);
+                    float val0 = float(src(i, jj,     k));
+                    float val1 = float(src(i, jj + 1, k));
+                    float val2 = float(src(i, jj + 2, k));
+                    float val3 = float(src(i, jj + 3, k));
 
                     // Apply scale inverses
-                    val0 *= channel_scales_inv(i + (jj    ) / pack_num * channel_stride);
-                    val1 *= channel_scales_inv(i + (jj + 1) / pack_num * channel_stride);
-                    val2 *= channel_scales_inv(i + (jj + 2) / pack_num * channel_stride);
-                    val3 *= channel_scales_inv(i + (jj + 3) / pack_num * channel_stride);
+                    val0 = val0 * channel_scales_inv(i + (jj    ) / pack_num * channel_stride) + channel_zero_q(i + (jj    ) / pack_num * channel_stride);
+                    val1 = val1 * channel_scales_inv(i + (jj + 1) / pack_num * channel_stride) + channel_zero_q(i + (jj + 1) / pack_num * channel_stride);
+                    val2 = val2 * channel_scales_inv(i + (jj + 2) / pack_num * channel_stride) + channel_zero_q(i + (jj + 2) / pack_num * channel_stride);
+                    val3 = val3 * channel_scales_inv(i + (jj + 3) / pack_num * channel_stride) + channel_zero_q(i + (jj + 3) / pack_num * channel_stride);
 
                     // Round and clamp the values
-                    val0 = fminf(fmaxf(roundf(val0), 0.0f), max_val);
-                    val1 = fminf(fmaxf(roundf(val1), 0.0f), max_val);
-                    val2 = fminf(fmaxf(roundf(val2), 0.0f), max_val);
-                    val3 = fminf(fmaxf(roundf(val3), 0.0f), max_val);
+                    val0 = fminf(fmaxf(nearbyintf(val0), 0.0f), max_val);
+                    val1 = fminf(fmaxf(nearbyintf(val1), 0.0f), max_val);
+                    val2 = fminf(fmaxf(nearbyintf(val2), 0.0f), max_val);
+                    val3 = fminf(fmaxf(nearbyintf(val3), 0.0f), max_val);
 
                     // Pack the 4 quantized values into a 16-bit integer
                     uint16_t packed = 0;
@@ -327,6 +356,71 @@ void qpack_Kchannel_Vtensor(Tensor1 &src, Tensor2 &dst,
 
     qpack_kc_vt<num_bits, Tensor1, Tensor2, Tensor3, Tensor4, Tensor5>::apply(src, dst, scales_k, zeros_k, reduce_tmp, num_params);
 
+}
+
+template<int kHeadDim, typename TensorV, typename TensorVPack, typename TensorVParams>
+CUTE_DEVICE
+void pack_Vtensor_2bit_interleaved(TensorV const& src, TensorVPack &dst, TensorVParams &params) {
+    static_assert(kHeadDim == 128, "2bit interleaved V pack currently expects headdim 128");
+    constexpr int kHeadDimPack = kHeadDim / 8;
+    constexpr int kGroupSize = 32;
+    constexpr int kNumGroups = kHeadDim / kGroupSize;
+    constexpr float max_val = 3.0f;
+
+    for (int idx = threadIdx.x; idx < size<0>(dst) * kNumGroups; idx += blockDim.x) {
+        const int row = idx / kNumGroups;
+        const int group = idx - row * kNumGroups;
+        const int group_start = group * kGroupSize;
+
+        float min_i = float(src(row, group_start));
+        float max_i = min_i;
+        CUTE_UNROLL
+        for (int g = 1; g < kGroupSize; ++g) {
+            const float x = float(src(row, group_start + g));
+            min_i = fminf(min_i, x);
+            max_i = fmaxf(max_i, x);
+        }
+
+        float scale_inv = 0.0f;
+        float zero_q = 0.0f;
+        float zero_dequant = 0.0f;
+        compute_affine_asym_params(min_i, max_i, max_val, scale_inv, zero_q, zero_dequant);
+        const float scale = scale_inv == 0.0f ? 0.0f : 1.0f / scale_inv;
+        using ParamsT = cute::remove_cvref_t<decltype(params(0, 0))>;
+        params(row, group) = make_pair2_vals<ParamsT>(scale, zero_dequant);
+    }
+
+    for (int idx = threadIdx.x; idx < size<0>(dst) * kHeadDimPack; idx += blockDim.x) {
+        const int row = idx / kHeadDimPack;
+        const int col = idx - row * kHeadDimPack;
+        uint16_t packed = 0;
+
+        CUTE_UNROLL
+        for (int slot = 0; slot < 8; ++slot) {
+            const int dim = col + 16 * slot;
+            const int group_start = (dim / 32) * 32;
+
+            float min_i = float(src(row, group_start));
+            float max_i = min_i;
+            CUTE_UNROLL
+            for (int g = 1; g < 32; ++g) {
+                const float x = float(src(row, group_start + g));
+                min_i = fminf(min_i, x);
+                max_i = fmaxf(max_i, x);
+            }
+
+            float scale_inv = 0.0f;
+            float zero_q = 0.0f;
+            float zero_dequant = 0.0f;
+            compute_affine_asym_params(min_i, max_i, max_val, scale_inv, zero_q, zero_dequant);
+
+            float q = float(src(row, dim)) * scale_inv + zero_q;
+            q = fminf(fmaxf(nearbyintf(q), 0.0f), max_val);
+            packed |= (uint16_t(q) & 0x3u) << (2 * slot);
+        }
+
+        dst(row, col) = packed;
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -409,7 +503,7 @@ void quant_Ktensor(Tensor1 &src, Tensor2 &dst,
 
     // Declare per-channel tensors
     using TensorChannel = decltype(make_fragment_like<float>(scales_k_g));
-    TensorChannel channel_max, channel_min, channel_range, channel_scales_inv, channel_zeros;
+    TensorChannel channel_max, channel_min, channel_range, channel_scales_inv, channel_zeros, channel_zero_q;
 
     CUTE_UNROLL
     for (int k = 0; k < size<1>(src); ++k) {
@@ -422,11 +516,13 @@ void quant_Ktensor(Tensor1 &src, Tensor2 &dst,
     for (int i = 0; i < size(channel_max); ++i) {
         float max_i = float(channel_max(i));
         float min_i = float(channel_min(i));
-        float range = max_i - min_i;
-        // Avoid division by zero
-        float scale_inv = (range > 0.0f) ? (max_val / range) : 0.0f;
+        float scale_inv = 0.0f;
+        float zero_q = 0.0f;
+        float zero_dequant = 0.0f;
+        compute_affine_asym_params(min_i, max_i, max_val, scale_inv, zero_q, zero_dequant);
         channel_scales_inv(i) = scale_inv;
-        channel_zeros(i)      = min_i;
+        channel_zero_q(i)     = zero_q;
+        channel_zeros(i)      = zero_dequant;
         // Store scales and zeros
         {
             auto &s_slot = scales_k_g(i);
@@ -436,7 +532,7 @@ void quant_Ktensor(Tensor1 &src, Tensor2 &dst,
         {
             auto &z_slot = zeros_k_g(i);
             using ZT = cute::remove_cvref_t<decltype(z_slot)>;
-            z_slot = ZT(min_i);
+            z_slot = ZT(zero_dequant);
         }
     }
 
@@ -449,10 +545,10 @@ void quant_Ktensor(Tensor1 &src, Tensor2 &dst,
 
             CUTE_UNROLL
             for (int jj = 0; jj < size<1>(src); jj += 4) {
-                float zero0 = float(channel_zeros(k / ki + jj + 0 * num_params));
-                float zero1 = float(channel_zeros(k / ki + jj + 1 * num_params));
-                float zero2 = float(channel_zeros(k / ki + jj + 2 * num_params));
-                float zero3 = float(channel_zeros(k / ki + jj + 3 * num_params));
+                float zero_q0 = float(channel_zero_q(k / ki + jj + 0 * num_params));
+                float zero_q1 = float(channel_zero_q(k / ki + jj + 1 * num_params));
+                float zero_q2 = float(channel_zero_q(k / ki + jj + 2 * num_params));
+                float zero_q3 = float(channel_zero_q(k / ki + jj + 3 * num_params));
 
                 float scale_inv0 = float(channel_scales_inv(k / ki + jj + 0 * num_params));
                 float scale_inv1 = float(channel_scales_inv(k / ki + jj + 1 * num_params));
@@ -464,21 +560,16 @@ void quant_Ktensor(Tensor1 &src, Tensor2 &dst,
                 // float val2 = float(src(i, jj + 2, k));
                 // float val3 = float(src(i, jj + 3, k));
                 
-                float val0 = float(src(i, jj, k)) - zero0;
-                float val1 = float(src(i, jj + 1, k)) - zero1;
-                float val2 = float(src(i, jj + 2, k)) - zero2;
-                float val3 = float(src(i, jj + 3, k)) - zero3;
-
-                val0 *= scale_inv0;
-                val1 *= scale_inv1;
-                val2 *= scale_inv2;
-                val3 *= scale_inv3;
+                float val0 = float(src(i, jj, k)) * scale_inv0 + zero_q0;
+                float val1 = float(src(i, jj + 1, k)) * scale_inv1 + zero_q1;
+                float val2 = float(src(i, jj + 2, k)) * scale_inv2 + zero_q2;
+                float val3 = float(src(i, jj + 3, k)) * scale_inv3 + zero_q3;
 
                 // Round and clamp the values
-                val0 = fminf(fmaxf(roundf(val0), 0.0f), max_val);
-                val1 = fminf(fmaxf(roundf(val1), 0.0f), max_val);
-                val2 = fminf(fmaxf(roundf(val2), 0.0f), max_val);
-                val3 = fminf(fmaxf(roundf(val3), 0.0f), max_val);
+                val0 = fminf(fmaxf(nearbyintf(val0), 0.0f), max_val);
+                val1 = fminf(fmaxf(nearbyintf(val1), 0.0f), max_val);
+                val2 = fminf(fmaxf(nearbyintf(val2), 0.0f), max_val);
+                val3 = fminf(fmaxf(nearbyintf(val3), 0.0f), max_val);
 
                 // Pack the 4 quantized values into a 16-bit integer
                 uint16_t packed = 0;
@@ -574,8 +665,17 @@ void pack_Vtensor_store(TiledCopyRS smem_tiled_copy, Tensor0 &src_r2s, Tensor1 &
     cute::copy(gmem_tiled_copy, src_s2g, dst_g2s);
     __syncthreads();
 
+    if constexpr (num_bits == 2) {
+        using ParamType = cute::remove_cvref_t<decltype(params(_0{}, _0{}))>;
+        for (int idx = threadIdx.x; idx < size(params); idx += blockDim.x) {
+            params(idx) = ParamType{};
+        }
+        __syncthreads();
+    }
+
     // copy params from register to global memory
-    const int num_params_2 = num_bits == 2 ? num_params / 2 : num_params;
+    const int params_dim = size<1>(params);
+    const int num_params_2 = num_bits == 2 && num_params > params_dim ? params_dim : num_params;
     CUTE_UNROLL
     for (int i = 0; i < size<1>(scales); ++i) {
         CUTE_UNROLL
@@ -588,4 +688,3 @@ void pack_Vtensor_store(TiledCopyRS smem_tiled_copy, Tensor0 &src_r2s, Tensor1 &
 }
 
 } // namespace quant
-

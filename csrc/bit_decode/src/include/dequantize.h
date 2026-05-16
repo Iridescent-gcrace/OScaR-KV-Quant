@@ -72,6 +72,32 @@ __device__ __forceinline__ __nv_bfloat162 make_pair2<__nv_bfloat162>(float val) 
 }
 
 template<typename T2>
+__device__ __forceinline__ T2 make_pair2_vals(float lo, float hi);
+
+template<>
+__device__ __forceinline__ __half2 make_pair2_vals<__half2>(float lo, float hi) {
+    return __floats2half2_rn(lo, hi);
+}
+
+template<>
+__device__ __forceinline__ __nv_bfloat162 make_pair2_vals<__nv_bfloat162>(float lo, float hi) {
+    return __float22bfloat162_rn(make_float2(lo, hi));
+}
+
+template<typename T2>
+__device__ __forceinline__ float2 pair2_to_float2(T2 val);
+
+template<>
+__device__ __forceinline__ float2 pair2_to_float2<__half2>(__half2 val) {
+    return __half22float2(val);
+}
+
+template<>
+__device__ __forceinline__ float2 pair2_to_float2<__nv_bfloat162>(__nv_bfloat162 val) {
+    return __bfloat1622float2(val);
+}
+
+template<typename T2>
 __device__ __forceinline__ Vec<T2, 4> convert_frag4(const FragA& frag);
 
 template<>
@@ -173,11 +199,8 @@ __device__ inline FragB lop3_dequant_2bit(int q) {
     const int HI = 0x00300030;
     const int EX = 0x64006400;
 
-    // Shift right by 8 to now consider elt_45 and elt_67. Issue first to hide RAW dependency if we issue
-    // immediately before required.
     const uint32_t top_i4s = q >> 8;
 
-    // Guarantee that the `(a & b) | c` operations are LOP3s.
     int lo_1_a = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);            // 0,8
     int lo_1_b = lop3<(0xf0 & 0xcc) | 0xaa>(q >> 2, LO, EX);       // 1,9
     int hi_1_a = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);            // 2,10
@@ -187,47 +210,35 @@ __device__ inline FragB lop3_dequant_2bit(int q) {
     int hi_2_a = lop3<(0xf0 & 0xcc) | 0xaa>(top_i4s, HI, EX);      // 6,14
     int hi_2_b = lop3<(0xf0 & 0xcc) | 0xaa>(top_i4s >> 2, HI, EX); // 7,15
 
-
-    // int hi_2 = lop3<(0xf0 & 0xcc) | 0xaa>(top_i4s, HI, EX);  // 3,7
-
-    // We want signed int4 outputs, hence we fuse the `-8` symmetric zero point directly into `SUB` and `ADD`.
-    const int SUB = 0x64006400; // {1024, 1024} 0x64086408 
-    const int MUL = 0x2c002c00; // {1/16, 1/16}
-    const int ADD = 0xd400d400; // {-64, -64} 0xd480d480 
+    const int SUB = 0x64006400;
+    const int MUL = 0x2c002c00;
+    const int ADD = 0xd400d400;
 
     FragB frag_b;
-    frag_b[0] = __hsub2(
-        *reinterpret_cast<half2*>(&lo_1_a),
-        *reinterpret_cast<const half2*>(&SUB)
-    ); // 0,8
-    frag_b[1] = __hsub2(
-        *reinterpret_cast<half2*>(&lo_1_b),
-        *reinterpret_cast<const half2*>(&SUB)
-    ); // 1,9
-    frag_b[2] = __hfma2(
-        *reinterpret_cast<half2*>(&hi_1_a),
-        *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD)
-    ); // 2,10
-    frag_b[3] = __hfma2(
-        *reinterpret_cast<half2*>(&hi_1_b),
-        *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD)
-    ); // 3,11
-    frag_b[4] = __hsub2(
-        *reinterpret_cast<half2*>(&lo_2_a),
-        *reinterpret_cast<const half2*>(&SUB)
-    ); // 4,12
-    frag_b[5] = __hsub2(
-        *reinterpret_cast<half2*>(&lo_2_b),
-        *reinterpret_cast<const half2*>(&SUB)
-    ); // 5,13
-    frag_b[6] = __hfma2(
-        *reinterpret_cast<half2*>(&hi_2_a),
-        *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD)
-    ); // 6,14
-    frag_b[7] = __hfma2(
-        *reinterpret_cast<half2*>(&hi_2_b),
-        *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD)
-    ); // 7,15
+    frag_b[0] = __hsub2(*reinterpret_cast<half2*>(&lo_1_a), *reinterpret_cast<const half2*>(&SUB));
+    frag_b[1] = __hsub2(*reinterpret_cast<half2*>(&lo_1_b), *reinterpret_cast<const half2*>(&SUB));
+    frag_b[2] = __hfma2(*reinterpret_cast<half2*>(&hi_1_a), *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD));
+    frag_b[3] = __hfma2(*reinterpret_cast<half2*>(&hi_1_b), *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD));
+    frag_b[4] = __hsub2(*reinterpret_cast<half2*>(&lo_2_a), *reinterpret_cast<const half2*>(&SUB));
+    frag_b[5] = __hsub2(*reinterpret_cast<half2*>(&lo_2_b), *reinterpret_cast<const half2*>(&SUB));
+    frag_b[6] = __hfma2(*reinterpret_cast<half2*>(&hi_2_a), *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD));
+    frag_b[7] = __hfma2(*reinterpret_cast<half2*>(&hi_2_b), *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD));
+
+    return frag_b;
+}
+
+__device__ inline FragB lop3_dequant_2bit_v(int q) {
+    const uint32_t lo = uint32_t(q) & 0xffffu;
+    const uint32_t hi = (uint32_t(q) >> 16) & 0xffffu;
+    FragB frag_b;
+    frag_b[0] = __floats2half2_rn(float((lo >> 0) & 0x3), float((lo >> 8) & 0x3));
+    frag_b[1] = __floats2half2_rn(float((lo >> 2) & 0x3), float((lo >> 10) & 0x3));
+    frag_b[2] = __floats2half2_rn(float((lo >> 4) & 0x3), float((lo >> 12) & 0x3));
+    frag_b[3] = __floats2half2_rn(float((lo >> 6) & 0x3), float((lo >> 14) & 0x3));
+    frag_b[4] = __floats2half2_rn(float((hi >> 8) & 0x3), float((hi >> 0) & 0x3));
+    frag_b[5] = __floats2half2_rn(float((hi >> 10) & 0x3), float((hi >> 2) & 0x3));
+    frag_b[6] = __floats2half2_rn(float((hi >> 12) & 0x3), float((hi >> 4) & 0x3));
+    frag_b[7] = __floats2half2_rn(float((hi >> 14) & 0x3), float((hi >> 6) & 0x3));
 
     return frag_b;
 }
@@ -317,6 +328,13 @@ template<int num_bits,
          class ZeroEngine,   class ZeroLayout>
 struct dequant_kc_vt;
 
+template<int num_bits,
+         class SourceEngine, class SourceLayout,  
+         class TargetEngine, class TargetLayout,
+         class ScaleEngine,  class ScaleLayout,
+         class ZeroEngine,   class ZeroLayout>
+struct dequant_kc_vt_v;
+
 template<class SourceEngine, class SourceLayout,  
          class TargetEngine, class TargetLayout,
          class ScaleEngine,  class ScaleLayout,
@@ -384,6 +402,54 @@ struct dequant_kc_vt<2, SourceEngine, SourceLayout, TargetEngine, TargetLayout, 
                 // target_vec(i,5) = src_val[5];
                 // target_vec(i,6) = src_val[6];
                 // target_vec(i,7) = src_val[7];
+            }
+        }
+    }
+};
+
+template<class SourceEngine, class SourceLayout,  
+         class TargetEngine, class TargetLayout,
+         class ScaleEngine,  class ScaleLayout,
+         class ZeroEngine,   class ZeroLayout>
+struct dequant_kc_vt_v<2, SourceEngine, SourceLayout, TargetEngine, TargetLayout, ScaleEngine, ScaleLayout, ZeroEngine, ZeroLayout> {
+    static constexpr int num_bits = 2;
+    CUTE_DEVICE static 
+    void apply(cute::Tensor<SourceEngine   , SourceLayout   > const& source,  
+               cute::Tensor<TargetEngine   , TargetLayout   > const& target,
+               cute::Tensor<ScaleEngine    , ScaleLayout    > const& scales,
+               cute::Tensor<ZeroEngine     , ZeroLayout     > const& zeros,
+               const int num_params) {
+        using TQ2 = cute::uint32_t;
+        using T   = typename TargetEngine::value_type;
+        using T2  = typename ParamsType<T>::type;
+        const int num_params_ = num_params / 2;
+
+        auto scales_vec  = cute::recast<T2>(scales);
+        auto zeros_vec   = cute::recast<T2>(zeros);
+        auto source_vec  = cute::recast<TQ2>(source);
+        auto target_vec  = cute::recast<T2>(target);
+        const int pack_num = 4 / num_params_;
+        const int channel_stride = size<0>(source_vec);
+
+        CUTE_UNROLL
+        for (int i = 0; i < cute::size<0>(source_vec); ++i) {
+            CUTE_UNROLL
+            for (int p = 0; p < cute::size<1>(source_vec); ++p) {
+                auto src_crd = cute::make_coord(i, p);
+                const uint32_t src_raw = uint32_t(source_vec(src_crd));
+                const uint32_t lo = src_raw & 0xffffu;
+
+                CUTE_UNROLL
+                for (int j = 0; j < size<1>(target_vec); ++j) {
+                    const int bit = 4 * j;
+                    T2 src_val = make_pair2_vals<T2>(
+                        float((lo >> bit) & 0x3),
+                        float((lo >> (bit + 2)) & 0x3));
+                    target_vec(i, j) = __hfma2(
+                        src_val,
+                        scales_vec(i + j / pack_num * channel_stride),
+                        zeros_vec(i + j / pack_num * channel_stride));
+                }
             }
         }
     }
@@ -465,6 +531,22 @@ dequant_Kchannel_Vtensor(
     const int num_params=1
 ) {  
     dequant_kc_vt<num_bits, SourceEngine, SourceLayout, TargetEngine, TargetLayout, ScaleEngine, ScaleLayout, ZeroEngine, ZeroLayout>::apply(source, target, scales_vec, zeros_vec, num_params);
+}
+
+template <class SourceEngine, class SourceLayout,  
+          class TargetEngine, class TargetLayout,
+          class ScaleEngine,  class ScaleLayout,
+          class ZeroEngine,   class ZeroLayout>  
+CUTE_DEVICE  
+void  
+dequant_Kchannel_Vtensor_v2(
+    cute::Tensor<SourceEngine   , SourceLayout   > const& source,  
+    cute::Tensor<TargetEngine   , TargetLayout   > const& target,
+    cute::Tensor<ScaleEngine    , ScaleLayout    > const& scales_vec,
+    cute::Tensor<ZeroEngine     , ZeroLayout    >  const& zeros_vec,
+    const int num_params=1
+) {  
+    dequant_kc_vt_v<2, SourceEngine, SourceLayout, TargetEngine, TargetLayout, ScaleEngine, ScaleLayout, ZeroEngine, ZeroLayout>::apply(source, target, scales_vec, zeros_vec, num_params);
 }
 
 template <class SourceEngine, class SourceLayout,  

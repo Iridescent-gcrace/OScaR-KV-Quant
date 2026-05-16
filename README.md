@@ -7,12 +7,24 @@
 git clone --recursive https://github.com/DD-DuDa/BitDecoding.git
 cd BitDecoding
 
-conda create -n bitdecode python=3.10 -y
-conda activate bitdecode
+uv venv --python 3.10 .venv-local
+source .venv-local/bin/activate
 
-pip install -r requirements.txt
+git submodule update --init --recursive
+
+uv pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0
+uv pip install -r requirements.txt
+uv pip install --no-build-isolation flash-attn
+
 python setup.py build_ext --inplace
 ```
+
+Validated stack on H20:
+
+- Python `3.10.17`
+- PyTorch `2.6.0+cu124`
+- `flash-attn 2.8.3`
+- `transformers 4.57.6`
 
 ## Run
 Set `MODEL_PATH` to your local Qwen3 checkpoint path before running the suite.

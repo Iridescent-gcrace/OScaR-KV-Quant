@@ -55,7 +55,9 @@ def load_model(args):
     config.group_size = args.group_size
     config.kv_rotation = args.kv_rotation
     config.kv_norm = args.kv_norm
-    config.residual_block_size = 256 if args.num_bits == 2 else 128
+    config.residual_block_size = 128
+    if args.residual_evict_size is not None:
+        config.residual_evict_size = args.residual_evict_size
 
     model = model_cls.from_pretrained(
         args.model_path,
@@ -81,6 +83,7 @@ def benchmark_throughput():
     parser.add_argument("--group_size", type=int, default=128)
     parser.add_argument("--kv_rotation", type=str, default="none")
     parser.add_argument("--kv_norm", type=str, default="0")
+    parser.add_argument("--residual_evict_size", type=int, default=None)
     
     args = parser.parse_args()
 

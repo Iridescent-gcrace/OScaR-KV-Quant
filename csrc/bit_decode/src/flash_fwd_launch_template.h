@@ -80,7 +80,8 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr size_t smem_size     = Kernel_traits::kSmemSize;
     constexpr size_t smem_size_res = Kernel_traits::kSmemSize_res;
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM; 
-    const int num_splits_ = params.num_splits - 1;
+    const bool has_residual = params.new_lens > 0;
+    const int num_splits_ = params.num_splits - (has_residual ? 1 : 0);
     
     dim3 grid_res(num_m_block, params.b, params.h);
     dim3 grid(num_m_block, num_splits_, params.b * params.h);
@@ -92,8 +93,10 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
             kernel_res, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_res));
     }
-    kernel_res<<<grid_res, Kernel_traits::kNThreads, smem_size_res, stream>>>(params);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (has_residual) {
+        kernel_res<<<grid_res, Kernel_traits::kNThreads, smem_size_res, stream>>>(params);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 
     auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, false, false, true, false, /*Split*/true, false, false>;
     if (smem_size >= 48 * 1024) {
@@ -130,7 +133,6 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T, int Headdim, bool Is_causal, int quant_mode, int num_bits, int group_size>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int kBlockM = 16;  // Fixed for all head dimensions
-    // constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
     constexpr static int kBlockN = 256;
     
     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, quant_mode, num_bits, group_size, T>, Is_causal>(params, stream);

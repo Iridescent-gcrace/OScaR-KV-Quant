@@ -19,7 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union, TypedDict
 
 import torch
 from torch import nn
@@ -41,7 +41,12 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
+from transformers.utils import auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
+try:
+    from transformers.utils import LossKwargs
+except ImportError:
+    class LossKwargs(TypedDict, total=False):
+        pass
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from flash_attn import flash_attn_with_kvcache
@@ -332,11 +337,19 @@ class Qwen3BitDecoding(Qwen3Attention):
         super().__init__(config, layer_idx)
         self.kv_rotation = getattr(config, "kv_rotation", "none")
         self.kv_norm = str(getattr(config, "kv_norm", "0"))
-        if self.num_bits == 2 and self.quant_mode == "k-channel" and self.residual_block_size != 256:
+        if self.num_bits == 2 and self.quant_mode == "k-channel" and self.residual_block_size != 128:
             logger.warning_once(
-                f"Overriding Qwen3 2-bit k-channel residual_block_size from {self.residual_block_size} to 256 to match the stable CUDA kernel tile."
+                f"Overriding Qwen3 2-bit k-channel residual_block_size from {self.residual_block_size} to 128 for the residual-128 experiment branch."
             )
-            self.residual_block_size = 256
+            self.residual_block_size = 128
+        default_evict_size = 256 if self.num_bits == 2 and self.quant_mode == "k-channel" else self.residual_block_size
+        self.residual_evict_size = int(getattr(config, "residual_evict_size", default_evict_size))
+        if self.num_bits == 2 and self.quant_mode == "k-channel" and self.residual_evict_size < self._main_pack_block_size():
+            raise ValueError(
+                "Qwen3 2-bit k-channel requires residual_evict_size >= 256 because the packed K cache "
+                "is laid out in 256-token tiles. Smaller evict sizes would append a local pack tile into "
+                "the middle of a global tile and corrupt K dequantization."
+            )
 
     def _use_custom_kv_transform(self) -> bool:
         return self.num_bits == 2 and (self.kv_rotation == "hadamard" or self.kv_norm == "1")
@@ -346,6 +359,177 @@ class Qwen3BitDecoding(Qwen3Attention):
         if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
             return None
         return tensor.contiguous()
+
+    def _uses_padded_main_pack(self) -> bool:
+        return self.num_bits == 2 and self.quant_mode == "k-channel"
+
+    def _main_pack_block_size(self) -> int:
+        return 256 if self._uses_padded_main_pack() else self.residual_block_size
+
+    def _residual_kernel_block_size(self) -> int:
+        return self.residual_evict_size
+
+    def _round_up_pack_len(self, seqlen: int) -> int:
+        block_size = self._main_pack_block_size()
+        return ((seqlen + block_size - 1) // block_size) * block_size
+
+    def _logical_pack_len(
+        self,
+        v_pack: torch.Tensor,
+        k_norm_pack: Optional[torch.Tensor],
+    ) -> int:
+        if self._uses_padded_main_pack() and isinstance(k_norm_pack, torch.Tensor) and k_norm_pack.numel() > 0:
+            return k_norm_pack.shape[-1]
+        return v_pack.shape[1]
+
+    def _pack_norm_or_ones(
+        self,
+        k_norm_pack: Optional[torch.Tensor],
+        batch_size: int,
+        seqlen: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if isinstance(k_norm_pack, torch.Tensor) and k_norm_pack.numel() > 0:
+            return k_norm_pack[:, :seqlen].contiguous().to(torch.float32)
+        return torch.ones((batch_size, seqlen), device=device, dtype=torch.float32)
+
+    def _pad_kv_states_for_main_pack(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        logical_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        if not self._uses_padded_main_pack():
+            return key_states, value_states, logical_len
+        physical_len = self._round_up_pack_len(logical_len)
+        if physical_len == logical_len:
+            return key_states, value_states, logical_len
+        pad_len = physical_len - logical_len
+        key_pad = key_states.new_zeros((key_states.shape[0], pad_len, key_states.shape[2], key_states.shape[3]))
+        value_pad = value_states.new_zeros((value_states.shape[0], pad_len, value_states.shape[2], value_states.shape[3]))
+        return torch.cat([key_states, key_pad], dim=1).contiguous(), torch.cat([value_states, value_pad], dim=1).contiguous(), physical_len
+
+    def _replace_pack_cache_with_appended_block(
+        self,
+        past_key_value: Cache,
+        old_k_pack: torch.Tensor,
+        old_k_params: torch.Tensor,
+        old_v_pack: torch.Tensor,
+        old_v_params: torch.Tensor,
+        old_k_norm_pack: Optional[torch.Tensor],
+        new_k_pack: torch.Tensor,
+        new_k_params: torch.Tensor,
+        new_v_pack: torch.Tensor,
+        new_v_params: torch.Tensor,
+        new_k_norm_pack: Optional[torch.Tensor],
+        old_logical_len: int,
+        append_len: Optional[int] = None,
+    ) -> bool:
+        if not self._uses_padded_main_pack() or not all(
+            hasattr(past_key_value, name)
+            for name in (
+                "key_cache_pack",
+                "key_cache_params",
+                "value_cache_pack",
+                "value_cache_params",
+                "key_cache_norm_pack",
+            )
+        ):
+            return False
+
+        pack_num = int(self.pack_nums)
+        if append_len is None:
+            append_len = (
+                new_k_norm_pack.shape[-1]
+                if isinstance(new_k_norm_pack, torch.Tensor) and new_k_norm_pack.numel() > 0
+                else new_v_pack.shape[1]
+            )
+        new_logical_len = old_logical_len + append_len
+        physical_len = self._round_up_pack_len(new_logical_len)
+        batch_size = old_v_pack.shape[0]
+        device = old_v_pack.device
+
+        merged_k_pack = old_k_pack.new_zeros(
+            (old_k_pack.shape[0], physical_len // pack_num, old_k_pack.shape[2], old_k_pack.shape[3])
+        )
+        merged_k_params = old_k_params.new_zeros(
+            (old_k_params.shape[0], physical_len // self.group_size, old_k_params.shape[2], old_k_params.shape[3])
+        )
+        merged_v_pack = old_v_pack.new_zeros(
+            (old_v_pack.shape[0], physical_len, old_v_pack.shape[2], old_v_pack.shape[3])
+        )
+        merged_v_params = old_v_params.new_zeros(
+            (old_v_params.shape[0], old_v_params.shape[1], old_v_params.shape[2], physical_len)
+        )
+
+        old_k_rows = old_logical_len // pack_num
+        old_param_rows = old_logical_len // self.group_size
+        append_k_rows = append_len // pack_num
+        append_param_rows = append_len // self.group_size
+
+        if old_logical_len > 0:
+            merged_k_pack[:, :old_k_rows].copy_(old_k_pack[:, :old_k_rows])
+            merged_k_params[:, :old_param_rows].copy_(old_k_params[:, :old_param_rows])
+            merged_v_pack[:, :old_logical_len].copy_(old_v_pack[:, :old_logical_len])
+            merged_v_params[:, :, :, :old_logical_len].copy_(old_v_params[:, :, :, :old_logical_len])
+
+        merged_k_pack[:, old_k_rows:old_k_rows + append_k_rows].copy_(new_k_pack[:, :append_k_rows])
+        merged_k_params[:, old_param_rows:old_param_rows + append_param_rows].copy_(new_k_params[:, :append_param_rows])
+        merged_v_pack[:, old_logical_len:new_logical_len].copy_(new_v_pack[:, :append_len])
+        merged_v_params[:, :, :, old_logical_len:new_logical_len].copy_(new_v_params[:, :, :, :append_len])
+
+        old_norm = self._pack_norm_or_ones(old_k_norm_pack, batch_size, old_logical_len, device)
+        new_norm = self._pack_norm_or_ones(new_k_norm_pack, batch_size, append_len, device)
+        merged_norm = torch.cat([old_norm, new_norm], dim=-1).contiguous()
+
+        past_key_value.key_cache_pack[self.layer_idx] = merged_k_pack.contiguous()
+        past_key_value.key_cache_params[self.layer_idx] = merged_k_params.contiguous()
+        past_key_value.value_cache_pack[self.layer_idx] = merged_v_pack.contiguous()
+        past_key_value.value_cache_params[self.layer_idx] = merged_v_params.contiguous()
+        past_key_value.key_cache_norm_pack[self.layer_idx] = merged_norm
+        return True
+
+    def _pack_residual_block_for_main_cache(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        logical_len = key_states.shape[1]
+        physical_len = self._round_up_pack_len(logical_len)
+        key_states_pack, value_states_pack, seqlen_pack_call = self._pad_kv_states_for_main_pack(
+            key_states.contiguous(), value_states.contiguous(), logical_len
+        )
+        batch_size, _, nheads_k, d = key_states_pack.shape
+        device = key_states_pack.device
+        pack_num = int(self.pack_nums)
+
+        k_pack = torch.zeros((batch_size, physical_len // pack_num, nheads_k, d), dtype=torch.uint16, device=device)
+        k_params = torch.zeros((batch_size, physical_len // self.group_size, nheads_k, d), dtype=torch.float32, device=device)
+        v_pack = torch.zeros((batch_size, physical_len, nheads_k, d // pack_num), dtype=torch.uint16, device=device)
+        v_params = torch.zeros((batch_size, d // self.group_size, nheads_k, physical_len), dtype=torch.float32, device=device)
+        cu_seqlens = torch.arange(
+            0,
+            (batch_size + 1) * seqlen_pack_call,
+            seqlen_pack_call,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        kvcache_pack_int(
+            key_states_pack,
+            k_pack,
+            k_params,
+            value_states_pack,
+            v_pack,
+            v_params,
+            None,
+            cu_seqlens,
+            seqlen_pack_call,
+            self.quant_mode,
+            self.group_size,
+            self.num_bits,
+        )
+        return k_pack, k_params, v_pack, v_params
 
     def _preprocess_key_cache_states(
         self,
@@ -448,13 +632,14 @@ class Qwen3BitDecoding(Qwen3Attention):
             k_pack, k_params, v_pack, v_params = past_key_value.update_pack(None, None, None, None, self.layer_idx)
             k_norm_pack = self._optional_cache_tensor(past_key_value.get_pack_norm(self.layer_idx))
 
-            seqlen_pack = v_pack.shape[1]
+            seqlen_pack = self._logical_pack_len(v_pack, k_norm_pack)
 
             seqlens_k = torch.full((batch_size,), seqlen_pack, dtype=torch.int32, device=device)
 
             # Get kv cache_residual and append new kv
-            k_residual = torch.zeros((batch_size, self.residual_block_size, nheads_k, d), device=device, dtype=dtype)
-            v_residual = torch.zeros((batch_size, self.residual_block_size, nheads_k, d), device=device, dtype=dtype)
+            residual_kernel_block_size = self._residual_kernel_block_size()
+            k_residual = torch.zeros((batch_size, residual_kernel_block_size, nheads_k, d), device=device, dtype=dtype)
+            v_residual = torch.zeros((batch_size, residual_kernel_block_size, nheads_k, d), device=device, dtype=dtype)
             residual_cache_kwargs = {"key_norm_states": key_norm_states} if key_norm_states is not None else None
             k_residual_cache, v_residual_cache = past_key_value.update_residual(
                 key_states, value_states, self.layer_idx, residual_cache_kwargs
@@ -467,7 +652,7 @@ class Qwen3BitDecoding(Qwen3Attention):
             v_residual[:, :cur_residual_len, :, :] = v_residual_cache
             k_norm_residual = None
             if k_norm_residual_cache is not None:
-                k_norm_residual = torch.ones((batch_size, self.residual_block_size), device=device, dtype=torch.float32)
+                k_norm_residual = torch.ones((batch_size, residual_kernel_block_size), device=device, dtype=torch.float32)
                 k_norm_residual[:, :cur_residual_len] = k_norm_residual_cache.to(torch.float32)
 
             # Run attention with KV cache
@@ -488,17 +673,41 @@ class Qwen3BitDecoding(Qwen3Attention):
                 k_norm_residual,
             )
                 
-            if cur_residual_len == self.residual_block_size:
+            if cur_residual_len == self.residual_evict_size:
                 k_norm_pack_new = self._optional_cache_tensor(k_norm_residual_cache)
                 pack_cache_kwargs = {"key_norm_states": k_norm_pack_new} if k_norm_pack_new is not None else None
-                past_key_value.update_pack(
-                    self.k_pack_new,
-                    self.k_params_new,
-                    self.v_pack_new,
-                    self.v_params_new,
-                    self.layer_idx,
-                    pack_cache_kwargs,
+                k_pack_new_for_cache = self.k_pack_new
+                k_params_new_for_cache = self.k_params_new
+                v_pack_new_for_cache = self.v_pack_new
+                v_params_new_for_cache = self.v_params_new
+                if self._uses_padded_main_pack():
+                    k_pack_new_for_cache, k_params_new_for_cache, v_pack_new_for_cache, v_params_new_for_cache = (
+                        self._pack_residual_block_for_main_cache(k_residual_cache, v_residual_cache)
+                    )
+                replaced_pack_cache = self._replace_pack_cache_with_appended_block(
+                    past_key_value,
+                    k_pack,
+                    k_params,
+                    v_pack,
+                    v_params,
+                    k_norm_pack,
+                    k_pack_new_for_cache,
+                    k_params_new_for_cache,
+                    v_pack_new_for_cache,
+                    v_params_new_for_cache,
+                    k_norm_pack_new,
+                    seqlen_pack,
+                    cur_residual_len,
                 )
+                if not replaced_pack_cache:
+                    past_key_value.update_pack(
+                        k_pack_new_for_cache,
+                        k_params_new_for_cache,
+                        v_pack_new_for_cache,
+                        v_params_new_for_cache,
+                        self.layer_idx,
+                        pack_cache_kwargs,
+                    )
                 past_key_value.clear_residual(self.layer_idx)
 
             attn_weights = None
@@ -536,20 +745,27 @@ class Qwen3BitDecoding(Qwen3Attention):
             d = key_states.shape[3]
             seqlen_k = key_states.shape[1]
 
-            residual_len = seqlen_k % self.residual_block_size
+            residual_len = seqlen_k % self._main_pack_block_size()
             residual     = residual_len > 0
             seqlen_k_pack = seqlen_k - residual_len
+            seqlen_k_pack_physical = self._round_up_pack_len(seqlen_k_pack) if seqlen_k_pack > 0 else 0
             cu_seqlens_k_pack = (
-                torch.arange(0, (batch_size + 1) * seqlen_k_pack, seqlen_k_pack, dtype=torch.int32, device=device)
-                if seqlen_k_pack > 0 else None
+                torch.arange(
+                    0,
+                    (batch_size + 1) * seqlen_k_pack_physical,
+                    seqlen_k_pack_physical,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if seqlen_k_pack_physical > 0 else None
             )
 
             if self.quant_mode == 'k-channel':
-                k_pack   = torch.zeros((batch_size, int(seqlen_k_pack // self.pack_nums), nheads_k, d),  dtype=torch.uint16, device=device)
-                k_params = torch.zeros((batch_size, int(seqlen_k_pack // self.group_size), nheads_k, d), dtype=torch.float32, device=device)
+                k_pack   = torch.zeros((batch_size, int(seqlen_k_pack_physical // self.pack_nums), nheads_k, d),  dtype=torch.uint16, device=device)
+                k_params = torch.zeros((batch_size, int(seqlen_k_pack_physical // self.group_size), nheads_k, d), dtype=torch.float32, device=device)
 
-            v_pack   = torch.zeros((batch_size, seqlen_k_pack, nheads_k, int(d // self.pack_nums)),  dtype=torch.uint16, device=device)
-            v_params = torch.zeros((batch_size, int(d // self.group_size), nheads_k, seqlen_k_pack), dtype=torch.float32, device=device)
+            v_pack   = torch.zeros((batch_size, seqlen_k_pack_physical, nheads_k, int(d // self.pack_nums)),  dtype=torch.uint16, device=device)
+            v_params = torch.zeros((batch_size, int(d // self.group_size), nheads_k, seqlen_k_pack_physical), dtype=torch.float32, device=device)
 
             if residual:
                 k_state_residual = key_states[:, -residual_len:, :, :]
@@ -571,32 +787,39 @@ class Qwen3BitDecoding(Qwen3Attention):
                 k_norm_residual = None
 
             if seqlen_k_pack > 0 and use_custom_kv_transform:
+                k_state_past_pack, v_state_past_pack, seqlen_k_pack_call = self._pad_kv_states_for_main_pack(
+                    k_state_past, v_state_past, seqlen_k_pack
+                )
                 k_norm_pack = kvcache_pack_int(
-                    k_state_past, k_pack, k_params,
-                    v_state_past, v_pack, v_params,
+                    k_state_past_pack, k_pack, k_params,
+                    v_state_past_pack, v_pack, v_params,
                     None,
                     cu_seqlens_k_pack,
-                    seqlen_k_pack,
+                    seqlen_k_pack_call,
                     self.quant_mode,
                     self.group_size,
                     self.num_bits,
                     apply_k_hadamard=self.kv_rotation == "hadamard",
                     apply_k_norm=self.kv_norm == "1",
                 )
+                k_norm_pack = self._pack_norm_or_ones(k_norm_pack, batch_size, seqlen_k_pack, device)
             elif seqlen_k_pack > 0:
+                k_state_past_pack, v_state_past_pack, seqlen_k_pack_call = self._pad_kv_states_for_main_pack(
+                    k_state_past, v_state_past, seqlen_k_pack
+                )
                 kvcache_pack_int(
-                    k_state_past, k_pack, k_params,
-                    v_state_past, v_pack, v_params,
+                    k_state_past_pack, k_pack, k_params,
+                    v_state_past_pack, v_pack, v_params,
                     None,
                     cu_seqlens_k_pack,
-                    seqlen_k_pack,
+                    seqlen_k_pack_call,
                     self.quant_mode,
                     self.group_size,
                     self.num_bits
                 )
-                k_norm_pack = None
+                k_norm_pack = self._pack_norm_or_ones(None, batch_size, seqlen_k_pack, device) if self._uses_padded_main_pack() else None
             else:
-                k_norm_pack = None
+                k_norm_pack = self._pack_norm_or_ones(None, batch_size, 0, device) if self._uses_padded_main_pack() else None
 
             pack_cache_kwargs = {"key_norm_states": k_norm_pack} if k_norm_pack is not None else None
             past_key_value.update_pack(k_pack, k_params, v_pack, v_params, self.layer_idx, pack_cache_kwargs)

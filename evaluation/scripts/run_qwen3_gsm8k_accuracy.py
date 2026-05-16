@@ -74,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_bits", type=int, default=2)
     parser.add_argument("--quant_mode", default="k-channel")
     parser.add_argument("--group_size", type=int, default=32)
+    parser.add_argument("--print_generation", action="store_true")
     return parser.parse_args()
 
 
@@ -134,7 +135,7 @@ def main() -> None:
     config.group_size = args.group_size
     config.kv_rotation = variant["kv_rotation"]
     config.kv_norm = variant["kv_norm"]
-    config.residual_block_size = 256 if args.num_bits == 2 else 128
+    config.residual_block_size = 128
 
     model = Qwen3ForCausalLM.from_pretrained(
         args.model_path,
@@ -177,6 +178,8 @@ def main() -> None:
         ok = pred == gold
         correct += int(ok)
         print(f"idx={idx} pred={pred} gold={gold} ok={ok}")
+        if args.print_generation:
+            print(f"generation[{idx}]={generated!r}")
 
     print(f"accuracy={correct}/{len(indices)} variant={args.variant}")
 

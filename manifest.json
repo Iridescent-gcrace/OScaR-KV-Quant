@@ -1,0 +1,18 @@
+{
+  "model_path": "/home/yangrui55/models/Qwen3-8B",
+  "datasets": [
+    "qasper_e"
+  ],
+  "max_input_len": 32768,
+  "max_samples": null,
+  "attn_backend": "bit_decoding",
+  "num_bits": 2,
+  "quant_mode": "k-channel",
+  "group_size": 32,
+  "kv_rotation": "hadamard",
+  "kv_norm": "1",
+  "residual_block_size": 128,
+  "residual_evict_size": 256,
+  "offline_v_hadamard": true,
+  "dtype": "bfloat16"
+}

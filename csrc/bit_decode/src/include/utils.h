@@ -22,6 +22,10 @@
 #include <cutlass/numeric_types.h>
 #include "dequantize.h"
 
+#ifndef FLASH_FORCE_2BIT_SCALAR_PV
+#define FLASH_FORCE_2BIT_SCALAR_PV 0
+#endif
+
 #define PRINT(name, content) \
     print(name);             \
     print(" : ");            \
@@ -178,6 +182,221 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
             if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<int kBlockN, bool CheckBounds, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3>
+__forceinline__ __device__ void load_Vtensor_2bit_gather_fragment(
+        Tensor0 &tCrB_dequant,
+        Tensor1 const& sV_pack,
+        Tensor2 const& sV_params,
+        Tensor3 const& tOcVt,
+        const int k_tile,
+        const int n_valid) {
+    static_assert(kBlockN == 256, "2bit V gather assumes the 256-token split-K tile layout");
+    CUTE_STATIC_ASSERT_V(size<0>(tCrB_dequant) == Int<4>{});
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB_dequant) == Int<4>{});
+    CUTE_STATIC_ASSERT_V(size<2>(tCrB_dequant) == Int<16>{});
+    CUTE_STATIC_ASSERT_V(size<0>(tCrB_dequant) == size<0>(tOcVt));
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB_dequant) == size<1>(tOcVt));
+    CUTE_STATIC_ASSERT_V(size<2>(tCrB_dequant) == size<2>(tOcVt));
+    using Element = cute::remove_cvref_t<decltype(tCrB_dequant(0, 0, 0))>;
+    cutlass::NumericConverter<Element, float> convert_op;
+
+    const int dim_base = threadIdx.x >> 2;
+    const int pack_col = dim_base & 15;
+    const int slot_base = dim_base >> 4;
+    const int token_base = (k_tile << 4) + ((threadIdx.x & 3) << 1);
+    const int token0 = token_base;
+    const int token1 = token_base + 1;
+    const int token2 = token_base + 8;
+    const int token3 = token_base + 9;
+
+    uint16_t word0 = 0;
+    uint16_t word1 = 0;
+    uint16_t word2 = 0;
+    uint16_t word3 = 0;
+    if constexpr (CheckBounds) {
+        if (token0 < n_valid) { word0 = uint16_t(sV_pack(token0, pack_col)); }
+        if (token1 < n_valid) { word1 = uint16_t(sV_pack(token1, pack_col)); }
+        if (token2 < n_valid) { word2 = uint16_t(sV_pack(token2, pack_col)); }
+        if (token3 < n_valid) { word3 = uint16_t(sV_pack(token3, pack_col)); }
+    } else {
+        word0 = uint16_t(sV_pack(token0, pack_col));
+        word1 = uint16_t(sV_pack(token1, pack_col));
+        word2 = uint16_t(sV_pack(token2, pack_col));
+        word3 = uint16_t(sV_pack(token3, pack_col));
+    }
+
+    CUTE_UNROLL
+    for (int ni = 0; ni < 4; ++ni) {
+        const int slot = slot_base + (ni << 1);
+        const int group = ni;
+
+        float val0 = 0.0f;
+        if constexpr (CheckBounds) {
+            if (token0 < n_valid) {
+                const float q0 = float((word0 >> (2 * slot)) & 0x3u);
+                const float2 scale_zero0 = quant::pair2_to_float2(sV_params(token0, group));
+                val0 = q0 * scale_zero0.x + scale_zero0.y;
+            }
+        } else {
+            const float q0 = float((word0 >> (2 * slot)) & 0x3u);
+            const float2 scale_zero0 = quant::pair2_to_float2(sV_params(token0, group));
+            val0 = q0 * scale_zero0.x + scale_zero0.y;
+        }
+        tCrB_dequant(0, ni, k_tile) = convert_op(val0);
+
+        float val1 = 0.0f;
+        if constexpr (CheckBounds) {
+            if (token1 < n_valid) {
+                const float q1 = float((word1 >> (2 * slot)) & 0x3u);
+                const float2 scale_zero1 = quant::pair2_to_float2(sV_params(token1, group));
+                val1 = q1 * scale_zero1.x + scale_zero1.y;
+            }
+        } else {
+            const float q1 = float((word1 >> (2 * slot)) & 0x3u);
+            const float2 scale_zero1 = quant::pair2_to_float2(sV_params(token1, group));
+            val1 = q1 * scale_zero1.x + scale_zero1.y;
+        }
+        tCrB_dequant(1, ni, k_tile) = convert_op(val1);
+
+        float val2 = 0.0f;
+        if constexpr (CheckBounds) {
+            if (token2 < n_valid) {
+                const float q2 = float((word2 >> (2 * slot)) & 0x3u);
+                const float2 scale_zero2 = quant::pair2_to_float2(sV_params(token2, group));
+                val2 = q2 * scale_zero2.x + scale_zero2.y;
+            }
+        } else {
+            const float q2 = float((word2 >> (2 * slot)) & 0x3u);
+            const float2 scale_zero2 = quant::pair2_to_float2(sV_params(token2, group));
+            val2 = q2 * scale_zero2.x + scale_zero2.y;
+        }
+        tCrB_dequant(2, ni, k_tile) = convert_op(val2);
+
+        float val3 = 0.0f;
+        if constexpr (CheckBounds) {
+            if (token3 < n_valid) {
+                const float q3 = float((word3 >> (2 * slot)) & 0x3u);
+                const float2 scale_zero3 = quant::pair2_to_float2(sV_params(token3, group));
+                val3 = q3 * scale_zero3.x + scale_zero3.y;
+            }
+        } else {
+            const float q3 = float((word3 >> (2 * slot)) & 0x3u);
+            const float2 scale_zero3 = quant::pair2_to_float2(sV_params(token3, group));
+            val3 = q3 * scale_zero3.x + scale_zero3.y;
+        }
+        tCrB_dequant(3, ni, k_tile) = convert_op(val3);
+    }
+}
+
+template<int kBlockN,
+         bool A_in_regs=false,
+         typename Tensor0, typename Tensor1, typename Tensor2,
+         typename Tensor3, typename Tensor4, typename Tensor5, typename Tensor6,
+         typename TiledMma, typename TiledCopyA, typename ThrCopyA>
+__forceinline__ __device__ void gemm_Vtensor_2bit_gather(
+        Tensor0 &acc,
+        Tensor1 &tCrA,
+        Tensor2 &tCrB_dequant,
+        Tensor3 const& sV_pack,
+        Tensor4 const& sV_params,
+        Tensor5 const& tCsA,
+        Tensor6 const& tOcVt,
+        TiledMma tiled_mma,
+        TiledCopyA smem_tiled_copy_A,
+        ThrCopyA smem_thr_copy_A,
+        const int n_valid) {
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));          // MMA_M
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB_dequant) == size<2>(acc));  // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB_dequant)); // MMA_K
+    CUTE_STATIC_ASSERT_V(size<0>(tCrB_dequant) == size<0>(tOcVt));
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB_dequant) == size<1>(tOcVt));
+    CUTE_STATIC_ASSERT_V(size<2>(tCrB_dequant) == size<2>(tOcVt));
+
+    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view)); // M
+
+    if (!A_in_regs) {
+        cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{}));
+    }
+    const bool check_bounds = n_valid != kBlockN;
+
+    if (check_bounds) {
+        flash::load_Vtensor_2bit_gather_fragment<kBlockN, true>(
+            tCrB_dequant, sV_pack, sV_params, tOcVt, 0, n_valid
+        );
+        CUTE_UNROLL
+        for (int i = 0; i < size<2>(tCrA); ++i) {
+            if (i < size<2>(tCrA) - 1) {
+                if (!A_in_regs) {
+                    cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1));
+                }
+                flash::load_Vtensor_2bit_gather_fragment<kBlockN, true>(
+                    tCrB_dequant, sV_pack, sV_params, tOcVt, i + 1, n_valid
+                );
+            }
+            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB_dequant(_, _, i), acc);
+        }
+    } else {
+        flash::load_Vtensor_2bit_gather_fragment<kBlockN, false>(
+            tCrB_dequant, sV_pack, sV_params, tOcVt, 0, kBlockN
+        );
+        CUTE_UNROLL
+        for (int i = 0; i < size<2>(tCrA); ++i) {
+            if (i < size<2>(tCrA) - 1) {
+                if (!A_in_regs) {
+                    cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1));
+                }
+                flash::load_Vtensor_2bit_gather_fragment<kBlockN, false>(
+                    tCrB_dequant, sV_pack, sV_params, tOcVt, i + 1, kBlockN
+                );
+            }
+            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB_dequant(_, _, i), acc);
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<int kBlockN, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3, typename Tensor4>
+__forceinline__ __device__ void gemm_Vtensor_2bit_scalar(
+        Tensor0 &acc,
+        Tensor1 const& sAcc,
+        Tensor2 const& sV_pack,
+        Tensor3 const& sV_params,
+        Tensor4 const& taccOcO,
+        const int n_valid) {
+    static_assert(kBlockN % 16 == 0, "2bit scalar V path expects a tensor-core K multiple");
+
+    CUTE_UNROLL
+    for (int mma = 0; mma < size<0>(acc); ++mma) {
+        CUTE_UNROLL
+        for (int mi = 0; mi < size<1>(acc); ++mi) {
+            CUTE_UNROLL
+            for (int ni = 0; ni < size<2>(acc); ++ni) {
+                const auto coord = taccOcO(mma, mi, ni);
+                const int row = get<0>(coord);
+                const int dim = get<1>(coord);
+                const int pack_col = dim & 15;
+                const int slot = dim >> 4;
+                const int group = dim >> 5;
+
+                float sum = 0.0f;
+                for (int n = 0; n < kBlockN; ++n) {
+                    if (n < n_valid) {
+                        const uint16_t word = uint16_t(sV_pack(n, pack_col));
+                        const float q = float((word >> (2 * slot)) & 0x3u);
+                        const float2 scale_zero = quant::pair2_to_float2(sV_params(n, group));
+                        sum += float(sAcc(row, n)) * (q * scale_zero.x + scale_zero.y);
+                    }
+                }
+                acc(mma, mi, ni) += sum;
+            }
+        }
     }
 }
 

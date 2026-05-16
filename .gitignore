@@ -50,3 +50,6 @@ evaluation/results/
 *.so
 
 libtorch/
+
+longbench*
+evaluation/results

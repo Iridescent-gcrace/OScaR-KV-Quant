@@ -280,12 +280,10 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
 void set_params_splitkv(Flash_fwd_params &params, const int batch_size,
     const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
     const int head_size_rounded, const float p_dropout,
-    const int num_splits, cudaDeviceProp *dprops, struct c10::TensorOptions opts) {
+    const int num_splits, const int block_n, cudaDeviceProp *dprops, struct c10::TensorOptions opts,
+    at::Tensor &softmax_lse_accum, at::Tensor &out_accum) {
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
-    // TODO
-    // const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
-    const int block_n = 256;
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
@@ -298,11 +296,15 @@ void set_params_splitkv(Flash_fwd_params &params, const int batch_size,
             // printf("num_splits = %d\n", params.num_splits);
             // params.num_splits= 1;
         }
-        params.num_splits += 1;  // We need to add 1 for residual kernel.
+        const bool has_residual = params.new_lens > 0;
+        if (!has_residual && params.num_splits < 2) {
+            params.num_splits = 2;
+        }
+        params.num_splits += has_residual ? 1 : 0;  // Residual kernel owns the last split.
         // printf("num_splits = %d\n", params.num_splits);
         if (params.num_splits > 1) {
-            at::Tensor softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-            at::Tensor out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
+            softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, params.seqlen_q_rounded}, opts.dtype(at::kFloat));
+            out_accum = torch::empty({params.num_splits, batch_size, num_heads, params.seqlen_q_rounded, head_size_rounded}, opts.dtype(at::kFloat));
             params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
             params.oaccum_ptr = out_accum.data_ptr();
         }
@@ -509,9 +511,13 @@ mha_fwd_kvcache(at::Tensor &q,                       // batch_size x seqlen_q x 
     params.page_block_size      = page_block_size;
     params.page_block_size_pack = page_block_size_pack;
 
+    at::Tensor softmax_lse_accum;
+    at::Tensor out_accum;
     set_params_splitkv(params, batch_size, num_heads,
                        head_size, seqlen_k, seqlen_q,
-                       head_size_rounded, /*dropout*/0.f, num_splits, dprops, opts);
+                       head_size_rounded, /*dropout*/0.f, num_splits,
+                       256, dprops, opts,
+                       softmax_lse_accum, out_accum);
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,
@@ -687,4 +693,3 @@ void kvcache_qpack(const at::Tensor &k,
 
     return;
 }
-

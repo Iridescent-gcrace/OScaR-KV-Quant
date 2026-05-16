@@ -77,7 +77,7 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int num_bits   = num_bits_;
     static constexpr int pack_num   = 16 / num_bits;
 
-    static constexpr int residual_block_size = num_bits == 4 ? 128 : 256;
+    static constexpr int residual_block_size = 128;
 
     // The number of threads.
     static constexpr int kNWarps    = kNWarps_;
@@ -85,12 +85,13 @@ struct Flash_fwd_kernel_traits : public Base {
 
     static constexpr int kBlockM            = kBlockM_;
     static constexpr int kBlockN            = kBlockN_;
-    static constexpr int kBlockN_pack       = num_bits   == 4 ? 128 : 256;
-    static constexpr int kBlockN_residual   = kBlockN_pack;
+    static constexpr int kBlockN_pack       = num_bits == 4 ? 128 : 256;
+    static constexpr int kBlockN_new_pack   = residual_block_size;
+    static constexpr int kBlockN_residual   = residual_block_size;
     static constexpr int kBlockP            = quant_mode == 1 ? kBlockN / pack_num : kBlockN;
-    static constexpr int kBlockP_new_pack   = quant_mode == 1 ? kBlockN_pack / pack_num : kBlockN_pack;
+    static constexpr int kBlockP_new_pack   = quant_mode == 1 ? kBlockN_new_pack / pack_num : kBlockN_new_pack;
     static constexpr int kBlockK_params     = quant_mode == 1 ? kBlockN / group_size : kBlockN;
-    static constexpr int kBlockK_params_new = quant_mode == 1 ? kBlockN_pack / group_size : kBlockN_pack;
+    static constexpr int kBlockK_params_new = quant_mode == 1 ? kBlockN_new_pack / group_size : kBlockN_new_pack;
     static constexpr int kHeadDim           = kHeadDim_;
     static constexpr int kHeadDim_pack      = kHeadDim / pack_num; 
     static constexpr int kHeadDim_k         = quant_mode == 1 ? kHeadDim : kHeadDim_pack;
@@ -113,7 +114,8 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int tile_paramsv_k   = kBlockN / 16;    
     static constexpr int tile_paramsv_k_r = kBlockN_residual / 16;
 
-    static constexpr int num_params = kBlockN_pack / group_size; // TODO: check 128
+    static constexpr int num_params = kBlockN_pack / group_size;
+    static constexpr int num_params_new = kBlockN_new_pack / group_size;
 
     //
     // Tiled MMA
@@ -128,6 +130,20 @@ struct Flash_fwd_kernel_traits : public Base {
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<1>,_4,_1>>,  
         Tile<Int<16>, Int<32>, _16>>;
+
+    using TiledMmaVPack_4bit = TiledMMA<
+        typename Base::MMA_Atom_Arch,
+        Layout<Shape<Int<1>,_4,_1>>,
+        Tile<Int<16>, Int<32>, _16>>;
+    using TiledMmaVPack_2bit = TiledMMA<
+        typename Base::MMA_Atom_Arch,
+        Layout<Shape<Int<1>,_4,_1>>,
+        Tile<Int<16>, Int<32>, _16>>;
+    using TiledMmaVPack = std::conditional_t<
+        num_bits == 2,
+        TiledMmaVPack_2bit,
+        TiledMmaVPack_4bit
+    >;
 
     using TiledMma_residual = TiledMmaKV_i4;
 
@@ -222,9 +238,13 @@ struct Flash_fwd_kernel_traits : public Base {
                     Layout<Shape<_8, Int<kHeadDim_pack>>,
                            Stride<Int<kHeadDim_pack>, _1>>{}));
 
-    using SmemLayoutVPack = decltype(tile_to_shape(
+    using SmemLayoutVPackSwizzled = decltype(tile_to_shape(
         SmemLayoutAtomV_SW{},
         Shape<Int<kBlockN>, Int<kHeadDim_pack>>{}));
+    using SmemLayoutVPackPlain = decltype(
+        make_layout(make_shape(Int<kBlockN>{}, Int<kHeadDim_pack>{}),
+                    make_stride(Int<kHeadDim_pack>{}, Int<1>{})));
+    using SmemLayoutVPack = SmemLayoutVPackSwizzled;
     using SmemLayoutVPacktransposed  = decltype(
         composition(SmemLayoutVPack{}, make_layout(Shape<Int<kHeadDim_pack>, Int<kBlockN>>{}, GenRowMajor{})));
     using SmemLayoutVPacktransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVPacktransposed{}));
@@ -237,10 +257,10 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemLayoutVResidualtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVResidualtransposed{}));
 
     using SmemLayoutVNewPack = decltype(
-        make_layout(make_shape(Int<kBlockN_pack>{}, Int<kHeadDim_pack>{}),
+        make_layout(make_shape(Int<kBlockN_new_pack>{}, Int<kHeadDim_pack>{}),
                     make_stride(Int<kHeadDim_pack>{}, Int<1>{})));
     using SmemLayoutVNewPacktransposed = decltype(
-        composition(SmemLayoutVNewPack{}, make_layout(Shape<Int<kHeadDim_pack>, Int<kBlockN_pack>>{}, GenRowMajor{})));
+        composition(SmemLayoutVNewPack{}, make_layout(Shape<Int<kHeadDim_pack>, Int<kBlockN_new_pack>>{}, GenRowMajor{})));
 
     // using SmemLayoutVNewPack = SmemLayoutKNewPack;
     // using SmemLayoutVNewPacktransposed = SmemLayoutKNewPacktransposed_;
@@ -340,10 +360,19 @@ struct Flash_fwd_kernel_traits : public Base {
 
     // TODO: check 32, 4
     // KV
-    using GmemTileCopyK_Pack = decltype(
+    using GmemTileCopyK_Pack_BN128_2bit = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct, ElementKVPack>{},
+                        make_layout(make_shape(_16{}, _8{}), make_stride(_8{}, _1{})),
+                        Layout<Shape<_1, _8>>{}));
+    using GmemTileCopyK_Pack_Default = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, ElementKVPack>{},
                         make_layout(make_shape(_32{}, _4{}), make_stride(_4{}, _1{})),
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
+    using GmemTileCopyK_Pack = std::conditional_t<
+        quant_mode == 1 && num_bits == 2 && kBlockP == 16,
+        GmemTileCopyK_Pack_BN128_2bit,
+        GmemTileCopyK_Pack_Default
+    >;
     using GmemTileCopyV_Pack_2bit = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, ElementKVPack>{},
                         make_layout(make_shape(_64{}, _2{}), make_stride(_2{}, _1{})),
@@ -357,10 +386,29 @@ struct Flash_fwd_kernel_traits : public Base {
         GmemTileCopyV_Pack_2bit,
         GmemTileCopyV_Pack_4bit
     >;
-    using GmemTileCopyKV_NewPack = decltype(
+    using GmemTileCopyK_NewPack_BN128_2bit = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, ElementKVPack>{},
+                        make_layout(make_shape(_16{}, _8{}), make_stride(_8{}, _1{})),
+                        Layout<Shape<_1, _4>>{}));
+    using GmemTileCopyK_NewPack_Default = decltype(
         make_tiled_copy(Copy_Atom<DefaultCopy, ElementKVPack>{},
                         make_layout(make_shape(_32{}, _4{}), make_stride(_4{}, _1{})),
                         Layout<Shape<_1, _4>>{}));  // Val layout, 8 vals per read
+    using GmemTileCopyK_NewPack = std::conditional_t<
+        quant_mode == 1 && num_bits == 2 && kBlockP_new_pack == 16,
+        GmemTileCopyK_NewPack_BN128_2bit,
+        GmemTileCopyK_NewPack_Default
+    >;
+    using GmemTileCopyV_NewPack_2bit = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, ElementKVPack>{},
+                        make_layout(make_shape(_32{}, _4{}), make_stride(_4{}, _1{})),
+                        Layout<Shape<_1, _4>>{}));
+    using GmemTileCopyV_NewPack_4bit = GmemTileCopyK_NewPack_Default;
+    using GmemTileCopyV_NewPack = std::conditional_t<
+        num_bits == 2,
+        GmemTileCopyV_NewPack_2bit,
+        GmemTileCopyV_NewPack_4bit
+    >;
 
     // KV params
     using GmemTileCopyKParams_BN128 = decltype(
@@ -438,6 +486,12 @@ struct Flash_fwd_kernel_traits : public Base {
 
     using S2RCopyAtomV     = SmemCopyAtomTransposed;
     using S2RCopyAtomV_i4  = Copy_Atom<SM75_U16x4_LDSM_T, ElementKVPack>;
+    using S2RCopyAtomV_i2  = Copy_Atom<SM75_U16x2_LDSM_T, ElementKVPack>;
+    using S2RCopyAtomVPack = std::conditional_t<
+        num_bits == 2,
+        S2RCopyAtomV_i4,
+        S2RCopyAtomV_i4
+    >;
 
     using SmemCopyAtomTransposed_i4 = Copy_Atom<SM75_U16x4_LDSM_T, ElementKVPack>;
     // using SmemCopyAtomTransposed_i4 = Copy_Atom<DefaultCopy, ElementKVPack>;
@@ -473,7 +527,7 @@ struct Flash_qpack_traits : public Base {
     static constexpr int kNThreads = kNWarps * 32;
     
     static constexpr int kBlockN           = kBlockN_;
-    static constexpr int kBlockN_pack      = num_bits   == 4 ? 128 : 256;
+    static constexpr int kBlockN_pack      = num_bits == 4 ? 128 : 256;
     static constexpr int kBlockP           = quant_mode == 1 ? kBlockN / pack_num : kBlockN;
     static constexpr int kBlockK_params    = quant_mode == 1 ? kBlockN / group_size : kBlockN;
     static constexpr int kHeadDim          = kHeadDim_;
@@ -502,6 +556,20 @@ struct Flash_qpack_traits : public Base {
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<1>,_4,_1>>,  
         Tile<Int<16>, Int<32>, _16>>;
+
+    using TiledMmaVPack_4bit = TiledMMA<
+        typename Base::MMA_Atom_Arch,
+        Layout<Shape<Int<1>,_4,_1>>,
+        Tile<Int<16>, Int<32>, _16>>;
+    using TiledMmaVPack_2bit = TiledMMA<
+        typename Base::MMA_Atom_Arch,
+        Layout<Shape<Int<1>,_4,_1>>,
+        Tile<Int<16>, Int<16>, _16>>;
+    using TiledMmaVPack = std::conditional_t<
+        num_bits == 2,
+        TiledMmaVPack_2bit,
+        TiledMmaVPack_4bit
+    >;
 
     using SmemLayoutAtomKV_SW = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
@@ -570,10 +638,19 @@ struct Flash_qpack_traits : public Base {
         make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
-    using GmemTileCopyK_Pack = decltype(
+    using GmemTileCopyK_Pack_BN128_2bit = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, ElementKVPack>{},
+                        make_layout(make_shape(_16{}, _8{}), make_stride(_8{}, _1{})),
+                        Layout<Shape<_1, _8>>{}));
+    using GmemTileCopyK_Pack_Default = decltype(
         make_tiled_copy(Copy_Atom<DefaultCopy, ElementKVPack>{},
                         make_layout(make_shape(_32{}, _4{}), make_stride(_4{}, _1{})),
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
+    using GmemTileCopyK_Pack = std::conditional_t<
+        quant_mode == 1 && num_bits == 2 && kBlockP == 16,
+        GmemTileCopyK_Pack_BN128_2bit,
+        GmemTileCopyK_Pack_Default
+    >;
     using GmemTileCopyV_Pack = decltype(
         make_tiled_copy(Copy_Atom<DefaultCopy, ElementKVPack>{},
                         make_layout(make_shape(_64{}, _2{}), make_stride(_2{}, _1{})),
