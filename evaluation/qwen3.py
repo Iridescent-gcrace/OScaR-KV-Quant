@@ -50,8 +50,8 @@ except ImportError:
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from flash_attn import flash_attn_with_kvcache
-from bit_decode import preprocess_k_cache, kvcache_pack_int, fwd_kvcache_int
-from bit_decode import Cache, DynamicCache, StaticCache
+from oscar import preprocess_k_cache, kvcache_pack_int, fwd_kvcache_int
+from oscar import Cache, DynamicCache, StaticCache
 
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
@@ -332,7 +332,7 @@ class Qwen3FlashDecodingAttention(Qwen3Attention):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-class Qwen3BitDecoding(Qwen3Attention):
+class Qwen3Oscar(Qwen3Attention):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__(config, layer_idx)
         self.kv_rotation = getattr(config, "kv_rotation", "none")
@@ -616,7 +616,7 @@ class Qwen3BitDecoding(Qwen3Attention):
             key_states = key_states_rope.transpose(1, 2)
             if use_custom_kv_transform:
                 logger.warning_once(
-                    "Using custom Qwen3 2-bit KV transform path: query Hadamard plus key Hadamard/norm preprocessing with the stable 2-bit BitDecoding kernels."
+                    "Using custom Qwen3 OScaR path: query Hadamard plus key Hadamard/norm preprocessing with the stable 2-bit CUDA kernels."
                 )
                 query_states = self._preprocess_query_states(query_states)
                 key_states, key_norm_states = self._preprocess_key_cache_states(key_states)
@@ -837,7 +837,7 @@ QWEN_ATTENTION_CLASSES = {
     "eager": Qwen3Attention,
     "flash_attention_2": Qwen3Attention,
     "flash_decoding": Qwen3FlashDecodingAttention,
-    "bit_decoding": Qwen3BitDecoding
+    "oscar": Qwen3Oscar,
 }
 
 class Qwen3DecoderLayer(GradientCheckpointingLayer):

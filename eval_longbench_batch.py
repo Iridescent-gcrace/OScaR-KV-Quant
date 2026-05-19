@@ -1,12 +1,12 @@
 """
-LongBench-E evaluation script for Oscar KV cache quantization.
+LongBench-E evaluation script for OScaR KV cache quantization.
 
 Usage:
     # Run one experiment (one model + one mode + one dataset)
-    CUDA_VISIBLE_DEVICES=0 python eval_longbench_batch.py --model llama3.1_8b --mode oscar2_rsqrt --dataset qasper_e
+    CUDA_VISIBLE_DEVICES=0 python eval_longbench_batch.py --model qwen3_8b --mode oscar2_rsqrt --dataset qasper_e
 
     # Evaluate results
-    python eval_long_bench.py --path pred/llama3.1_8b_oscar2_rsqrt/ --e
+    python eval_long_bench.py --path pred/qwen3_8b_oscar2_rsqrt/ --e
 """
 
 import os
@@ -22,18 +22,17 @@ import numpy as np
 import random
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from kv_cache_compression.monkeypatch import replace_llama, replace_qwen3
+from kv_cache_compression.monkeypatch import replace_qwen3
 from kv_cache_compression.quarot_utils import rotate_qwen3_ov_proj
 
 
-LOCAL_QWEN3_8B_PATH = "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-llm/zhichen/huggingface.co/Qwen/Qwen3-8B/"
+DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", "Qwen/Qwen3-8B")
 MODEL_PATHS = {
-    "llama3.1_8b": "meta-llama/Llama-3.1-8B",
-    "qwen3_8b": LOCAL_QWEN3_8B_PATH if os.path.exists(LOCAL_QWEN3_8B_PATH) else "Qwen/Qwen3-8B",
+    "qwen3_8b": DEFAULT_MODEL_PATH,
 }
-MODEL_NAMES = {"llama3.1_8b": "Llama-3.1-8B", "qwen3_8b": "Qwen3-8B"}
-MODEL_DTYPES = {"llama3.1_8b": torch.bfloat16, "qwen3_8b": torch.bfloat16}
-MODEL_MAX_LEN = {"llama3.1_8b": 32768, "qwen3_8b": 32768}
+MODEL_NAMES = {"qwen3_8b": "Qwen3-8B"}
+MODEL_DTYPES = {"qwen3_8b": torch.bfloat16}
+MODEL_MAX_LEN = {"qwen3_8b": 32768}
 
 # Default max_new_tokens per task type
 DATASET_NUM_TOKENS = {
@@ -119,8 +118,6 @@ def load_model(model_path, dtype, mode, model_type, args=None):
     model.eval()
 
     if args is not None and args.offline_v_hadamard:
-        if not model_type.startswith("qwen3"):
-            raise ValueError("--offline_v_hadamard is currently implemented for Qwen3 only")
         had_dim = getattr(model.config, "head_dim", None)
         if had_dim is None:
             had_dim = model.config.hidden_size // model.config.num_attention_heads
@@ -129,31 +126,19 @@ def load_model(model_path, dtype, mode, model_type, args=None):
 
     if mode == "oscar2_rsqrt":
         compress_args = _compress_args(args)
-        if model_type.startswith("qwen3"):
-            replace_qwen3(compress_args, model, "oscar")
-        else:
-            replace_llama(compress_args, model, "oscar")
+        replace_qwen3(compress_args, model, "oscar")
 
     elif mode == "oscar2_base":
         compress_args = _compress_args(args, k_norm_factoring=False)
-        if model_type.startswith("qwen3"):
-            replace_qwen3(compress_args, model, "oscar")
-        else:
-            replace_llama(compress_args, model, "oscar")
+        replace_qwen3(compress_args, model, "oscar")
 
     elif mode == "oscar2_no_hadamard":
         compress_args = _compress_args(args, use_hadamard=False, offline_v_hadamard=False)
-        if model_type.startswith("qwen3"):
-            replace_qwen3(compress_args, model, "oscar")
-        else:
-            replace_llama(compress_args, model, "oscar")
+        replace_qwen3(compress_args, model, "oscar")
 
     elif mode == "oscar4_rsqrt":
         compress_args = _compress_args(args, k_bits=4, v_bits=4)
-        if model_type.startswith("qwen3"):
-            replace_qwen3(compress_args, model, "oscar")
-        else:
-            replace_llama(compress_args, model, "oscar")
+        replace_qwen3(compress_args, model, "oscar")
 
     return model
 
@@ -161,7 +146,7 @@ def load_model(model_path, dtype, mode, model_type, args=None):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True,
-                        choices=["llama3.1_8b", "qwen3_8b"])
+                        choices=["qwen3_8b"])
     parser.add_argument("--mode", type=str, required=True,
                         choices=["baseline", "oscar2_rsqrt", "oscar2_base",
                                  "oscar2_no_hadamard", "oscar4_rsqrt"])
@@ -170,7 +155,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str, default=None,
                         help="Override model path/HuggingFace id")
     parser.add_argument("--residual_length", type=int, default=128,
-                        help="Oscar full-precision residual buffer length")
+                        help="OScaR full-precision residual buffer length")
     parser.add_argument("--offline_v_hadamard", action="store_true",
                         help="Absorb V Hadamard into Qwen3 v_proj/o_proj weights and skip runtime V Hadamard")
     parser.add_argument("--num_tokens", type=int, default=None,

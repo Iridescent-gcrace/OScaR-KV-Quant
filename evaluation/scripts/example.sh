@@ -7,7 +7,7 @@ QUANT_MODE="${QUANT_MODE:-k-channel}"
 GROUP_SIZE="${GROUP_SIZE:-128}"
 KV_ROTATION="${KV_ROTATION:-none}"
 KV_NORM="${KV_NORM:-0}"
-ATTN_BACKEND="${ATTN_BACKEND:-bit_decoding}"
+ATTN_BACKEND="${ATTN_BACKEND:-oscar}"
 
 "${PYTHON_BIN}" example.py \
     --model_path "${MODEL_PATH}" \
@@ -18,8 +18,4 @@ ATTN_BACKEND="${ATTN_BACKEND:-bit_decoding}"
     --group_size "${GROUP_SIZE}" \
     --kv_rotation "${KV_ROTATION}" \
     --kv_norm "${KV_NORM}" \
-    --attn_backend "${ATTN_BACKEND}" # flash_attention_2, flash_decoding, bit_decoding
-
-
-# meta-llama/Llama-3.1-8B-Instruct
-# Qwen/Qwen3-8B
+    --attn_backend "${ATTN_BACKEND}" # flash_attention_2, flash_decoding, oscar

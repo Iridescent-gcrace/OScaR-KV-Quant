@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import random
 import sys
 import time
@@ -21,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(EVAL_ROOT) not in sys.path:
     sys.path.insert(0, str(EVAL_ROOT))
 
-from bit_decode import Cache, DynamicCache, StaticCache  # noqa: E402
+from oscar import Cache, DynamicCache, StaticCache  # noqa: E402
 import transformers.cache_utils  # noqa: E402
 
 transformers.cache_utils.DynamicCache = DynamicCache
@@ -34,7 +35,7 @@ from eval_long_bench import scorer_e  # noqa: E402
 from evaluation.example import apply_offline_v_hadamard  # noqa: E402
 
 
-DEFAULT_MODEL_PATH = "/home/yangrui55/models/Qwen3-8B"
+DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", "Qwen/Qwen3-8B")
 LONG_BENCH_E_DATASETS = [
     "qasper_e",
     "multifieldqa_en_e",
@@ -122,7 +123,7 @@ def build_model(args: argparse.Namespace):
     config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
     dtype = resolve_torch_dtype(config, args.dtype)
     config._attn_implementation = "flash_attention_2"
-    config.attn_backend = "bit_decoding"
+    config.attn_backend = "oscar"
     config.num_bits = 2
     config.quant_mode = "k-channel"
     config.group_size = 32
@@ -236,7 +237,7 @@ def run_dataset(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LongBench-E runner for Qwen3 BitDecoding.")
+    parser = argparse.ArgumentParser(description="LongBench-E runner for Qwen3 OScaR.")
     parser.add_argument("--model_path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--datasets", default="all", help="Comma-separated *_e datasets or 'all'")
     parser.add_argument("--data_dir", type=Path, default=PROJECT_ROOT / "longbench_data" / "data")
@@ -277,7 +278,7 @@ def main() -> None:
         "datasets": selected,
         "max_input_len": args.max_input_len,
         "max_samples": args.max_samples,
-        "attn_backend": "bit_decoding",
+        "attn_backend": "oscar",
         "num_bits": 2,
         "quant_mode": "k-channel",
         "group_size": 32,

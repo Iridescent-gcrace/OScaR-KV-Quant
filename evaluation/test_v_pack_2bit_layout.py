@@ -13,13 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from bit_decode import fwd_kvcache_int, kvcache_pack_int, preprocess_k_cache  # noqa: E402
+from oscar import fwd_kvcache_int, kvcache_pack_int, preprocess_k_cache  # noqa: E402
 
 
 class VPack2BitLayoutTest(unittest.TestCase):
     def setUp(self) -> None:
         if not torch.cuda.is_available():
-            self.skipTest("CUDA is required for bit_decode CUDA kernels")
+            self.skipTest("CUDA is required for OScaR CUDA kernels")
         torch.cuda.set_device(0)
 
     def test_nontrivial_2bit_v_pattern_preserves_second_half_of_group(self) -> None:

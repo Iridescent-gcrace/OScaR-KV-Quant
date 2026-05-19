@@ -5,9 +5,9 @@ import math
 import triton
 
 import numpy as np
-import bit_decode_cuda as bit_decode_cuda
-from bit_decode import kvcache_pack_int, fwd_kvcache_int
-from bit_decode import DynamicCache
+import oscar_cuda as oscar_cuda
+from oscar import kvcache_pack_int, fwd_kvcache_int
+from oscar import DynamicCache
 
 
 def attention_ref(

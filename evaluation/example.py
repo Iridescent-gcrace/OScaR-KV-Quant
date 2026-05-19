@@ -1,4 +1,3 @@
-# LLaMA model with KIVI
 import warnings
 warnings.filterwarnings("ignore")
 import sys
@@ -13,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from bit_decode import DynamicCache, StaticCache, Cache
+from oscar import DynamicCache, StaticCache, Cache
 import transformers.cache_utils
 transformers.cache_utils.DynamicCache = DynamicCache
 transformers.cache_utils.StaticCache = StaticCache
@@ -95,13 +94,10 @@ def apply_offline_v_hadamard(model):
 def resolve_model_components(model_path):
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     model_type = getattr(config, "model_type", None)
-    if model_type == "llama":
-        from llama import LlamaForCausalLM
-        return config, LlamaForCausalLM
     if model_type == "qwen3":
         from qwen3 import Qwen3ForCausalLM
         return config, Qwen3ForCausalLM
-    raise ValueError(f"Unsupported model_type: {model_type}")
+    raise ValueError(f"Unsupported model_type: {model_type}. This repo only supports Qwen3.")
 
 
 def resolve_torch_dtype(config, dtype_name):
@@ -132,7 +128,7 @@ def extract_gsm8k_number(text):
 
 def main():
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Run LLaMA model with KIVI')
+    parser = argparse.ArgumentParser(description="Run a Qwen3 OScaR example")
     parser.add_argument('--model_path', type=str, required=True, help='Path to the pretrained model')
     parser.add_argument('--max_length', type=int, default=131072, help='Maximum length of the input sequence')
     parser.add_argument('--dtype', type=str, default='auto', help='Torch dtype: auto, float16, bfloat16, float32')
@@ -141,10 +137,10 @@ def main():
     parser.add_argument('--group_size', type=int, default=None, help='Group size for quantization')
     parser.add_argument('--kv_rotation', type=str, default='none', help='KV rotation mode, e.g. none or hadamard')
     parser.add_argument('--kv_norm', type=str, default='0', help='KV norm mode, e.g. 0 or 1')
-    parser.add_argument('--attn_backend', type=str, default='flash_attention_2', help='Attention implementation')
+    parser.add_argument('--attn_backend', type=str, default='flash_attention_2', help='Attention implementation, e.g. flash_attention_2, flash_decoding, oscar')
     parser.add_argument('--device', type=str, default='cuda:0', help='Model/device placement')
     parser.add_argument('--offline_v_hadamard', action='store_true', help='Absorb V Hadamard into Qwen3 v_proj/o_proj weights')
-    parser.add_argument('--residual_evict_size', type=int, default=None, help='Override Qwen3 bitdecoding residual eviction size')
+    parser.add_argument('--residual_evict_size', type=int, default=None, help='Override Qwen3 OScaR residual eviction size')
     parser.add_argument('--max_new_tokens', type=int, default=125, help='Maximum generated tokens')
     args = parser.parse_args()
 

@@ -7,7 +7,7 @@ import torch.nn as nn
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
-import bit_decode_cuda as bit_decode_cuda
+import oscar_cuda as oscar_cuda
 
 
 def _should_pad_qpack_outputs(
@@ -85,7 +85,7 @@ def preprocess_k_cache(
     if not apply_hadamard and not apply_norm:
         return key_states, None
 
-    key_states_out, key_norm = bit_decode_cuda.preprocess_k_cache(
+    key_states_out, key_norm = oscar_cuda.preprocess_k_cache(
         key_states.contiguous(),
         apply_hadamard,
         apply_norm,
@@ -118,7 +118,7 @@ def kvcache_pack_int(k_cache: torch.Tensor, k_pack: torch.Tensor, k_params: torc
     V_unpad = v_cache.reshape(batch_size * seqlen_k, nheads_k, d)
     if apply_k_hadamard or apply_k_norm:
         if num_bits == 4:
-            k_norm = bit_decode_cuda.kvcache_pack_int4_preprocess_k(
+            k_norm = oscar_cuda.kvcache_pack_int4_preprocess_k(
                 k_cache.contiguous(), k_pack_work, k_params_work,
                 v_cache.contiguous(), v_pack_work, v_params_work,
                 opt_block_table,
@@ -130,7 +130,7 @@ def kvcache_pack_int(k_cache: torch.Tensor, k_pack: torch.Tensor, k_params: torc
                 apply_k_norm,
             )
         elif num_bits == 2:
-            k_norm = bit_decode_cuda.kvcache_pack_int2_preprocess_k(
+            k_norm = oscar_cuda.kvcache_pack_int2_preprocess_k(
                 k_cache.contiguous(), k_pack_work, k_params_work,
                 v_cache.contiguous(), v_pack_work, v_params_work,
                 opt_block_table,
@@ -154,7 +154,7 @@ def kvcache_pack_int(k_cache: torch.Tensor, k_pack: torch.Tensor, k_params: torc
     K_unpad = k_cache.reshape(batch_size * seqlen_k, nheads_k, d)
 
     if num_bits == 4:
-        bit_decode_cuda.kvcache_pack_int4(K_unpad, k_pack_work, k_params_work,
+        oscar_cuda.kvcache_pack_int4(K_unpad, k_pack_work, k_params_work,
                                           V_unpad, v_pack_work, v_params_work,
                                           opt_block_table,
                                           cu_seqlens_k,
@@ -163,7 +163,7 @@ def kvcache_pack_int(k_cache: torch.Tensor, k_pack: torch.Tensor, k_params: torc
                                           group_size
                                          )
     elif num_bits == 2:
-        bit_decode_cuda.kvcache_pack_int2(K_unpad, k_pack_work, k_params_work,
+        oscar_cuda.kvcache_pack_int2(K_unpad, k_pack_work, k_params_work,
                                           V_unpad, v_pack_work, v_params_work,
                                           opt_block_table,
                                           cu_seqlens_k,
@@ -201,7 +201,7 @@ def fwd_kvcache_int(q: torch.Tensor,
                     opt_k_norm_new: Optional[torch.Tensor] = None):
     
     if num_bits == 4:
-        out_bit, k_pack_new, k_params_new, v_pack_new, v_params_new = bit_decode_cuda.fwd_kvcache_int4(
+        out_bit, k_pack_new, k_params_new, v_pack_new, v_params_new = oscar_cuda.fwd_kvcache_int4(
             q,
             k_pack, k_params, 
             v_pack, v_params,
@@ -223,7 +223,7 @@ def fwd_kvcache_int(q: torch.Tensor,
             opt_k_norm_new
         )
     elif num_bits == 2:
-        out_bit, k_pack_new, k_params_new, v_pack_new, v_params_new = bit_decode_cuda.fwd_kvcache_int2(
+        out_bit, k_pack_new, k_params_new, v_pack_new, v_params_new = oscar_cuda.fwd_kvcache_int2(
             q,
             k_pack, k_params,
             v_pack, v_params,

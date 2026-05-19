@@ -1361,7 +1361,7 @@ class SinkCache(Cache):
         # Update the sin/cos cache, which holds sin/cos values for all possible positions
         if using_rope and layer_idx == 0:
             # BC: some models still pass `sin`/`cos` with 2 dims. In those models, they are the full sin/cos. Remove
-            # after all RoPE models have a llama-like cache utilization.
+            # after all RoPE models converge on the same cache utilization.
             if cos.dim() == 2:
                 self._cos_cache = cos
                 self._sin_cache = sin
@@ -1446,10 +1446,10 @@ class StaticCache(Cache):
         ```python
         >>> from transformers import AutoTokenizer, AutoModelForCausalLM, StaticCache
 
-        >>> model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
+        >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B")
+        >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
 
-        >>> inputs = tokenizer(text="My name is Llama", return_tensors="pt")
+        >>> inputs = tokenizer(text="My name is Qwen", return_tensors="pt")
 
         >>> # Prepare a cache class and pass it to model's forward
         >>> # Leave empty space for 10 new tokens, which can be used when calling forward iteratively 10 times to generate

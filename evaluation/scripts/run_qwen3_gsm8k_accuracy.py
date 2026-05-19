@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(EVAL_ROOT) not in sys.path:
     sys.path.insert(0, str(EVAL_ROOT))
 
-from bit_decode import Cache, DynamicCache, StaticCache  # noqa: E402
+from oscar import Cache, DynamicCache, StaticCache  # noqa: E402
 import transformers.cache_utils  # noqa: E402
 
 transformers.cache_utils.DynamicCache = DynamicCache
@@ -30,7 +30,7 @@ from transformers import AutoConfig, AutoTokenizer  # noqa: E402
 from qwen3 import Qwen3ForCausalLM  # noqa: E402
 
 
-DEFAULT_MODEL_PATH = "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-llm/zhichen/huggingface.co/Qwen/Qwen3-8B/"
+DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", "Qwen/Qwen3-8B")
 
 VARIANTS: Dict[str, Dict[str, str]] = {
     "fa2": {
@@ -39,22 +39,22 @@ VARIANTS: Dict[str, Dict[str, str]] = {
         "kv_norm": "0",
     },
     "plain": {
-        "attn_backend": "bit_decoding",
+        "attn_backend": "oscar",
         "kv_rotation": "none",
         "kv_norm": "0",
     },
     "hada_norm": {
-        "attn_backend": "bit_decoding",
+        "attn_backend": "oscar",
         "kv_rotation": "hadamard",
         "kv_norm": "1",
     },
     "hadamard_only": {
-        "attn_backend": "bit_decoding",
+        "attn_backend": "oscar",
         "kv_rotation": "hadamard",
         "kv_norm": "0",
     },
     "norm_only": {
-        "attn_backend": "bit_decoding",
+        "attn_backend": "oscar",
         "kv_rotation": "none",
         "kv_norm": "1",
     },

@@ -1,5 +1,5 @@
 """
-Oscar KV Cache Quantization — Qwen3 attention forward.
+OScaR KV Cache Quantization — Qwen3 attention forward.
 Compatible with transformers >= 4.51 (Qwen3Attention API).
 """
 
@@ -8,7 +8,6 @@ import torch.nn as nn
 from typing import Optional, Tuple
 
 from transformers.cache_utils import Cache
-from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.utils import logging
 
@@ -25,6 +24,20 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(
         batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 def _get_kv_cache(past_key_value, layer_idx):
@@ -52,7 +65,7 @@ def qwen3_attention_forward_oscar(
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
-    Oscar KV cache quantization for Qwen3 backbone (eager attention).
+    OScaR KV cache quantization for Qwen3 backbone (eager attention).
 
     Flow:
     1. QKV projection + QK normalization
@@ -97,7 +110,7 @@ def qwen3_attention_forward_oscar(
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-    # Oscar: Hadamard rotation on Q, K
+    # OScaR: Hadamard rotation on Q, K
     if hasattr(self, 'quarot_quantizer'):
         query_states, key_states, value_states = self.quarot_quantizer.process_kv(
             query_states, key_states, value_states)

@@ -35,4 +35,4 @@ for batch_size in ${BATCH_SIZE[@]}; do
 done
 
 
-# flash_attention_2, flash_decoding, bit_decoding
+# flash_attention_2, flash_decoding, oscar

@@ -23,13 +23,10 @@ class ModelConfig:
 def resolve_model_components(model_path):
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     model_type = getattr(config, "model_type", None)
-    if model_type == "llama":
-        from llama import LlamaForCausalLM
-        return config, LlamaForCausalLM
     if model_type == "qwen3":
         from qwen3 import Qwen3ForCausalLM
         return config, Qwen3ForCausalLM
-    raise ValueError(f"Unsupported model_type: {model_type}")
+    raise ValueError(f"Unsupported model_type: {model_type}. This repo only supports Qwen3.")
 
 
 def resolve_torch_dtype(config, dtype_name):
@@ -70,7 +67,7 @@ def load_model(args):
 @torch.inference_mode()
 def benchmark_throughput():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", default="llama3-8b-instruct")
+    parser.add_argument("--model_path", default="Qwen/Qwen3-8B")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--context_len", type=int, default=2*1024)
     parser.add_argument("--decode_len", type=int, default=256)
@@ -159,7 +156,7 @@ def benchmark_throughput():
     print(f"Context Length: {context_len}")
     print(f"Decode Length: {decode_len}")
     print(f"Attention Backend: {args.attn_backend}")
-    if args.attn_backend == "bit_decoding":
+    if args.attn_backend == "oscar":
         print(f"KV Cache Quantization: {args.num_bits}-bit {args.quant_mode}")
     else:
         print("KV Cache Quantization: full precision")

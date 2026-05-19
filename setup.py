@@ -28,7 +28,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-PACKAGE_NAME = "bit_decode"
+PACKAGE_NAME = "oscar"
 
 BASE_WHEEL_URL = (
     "TODO"
@@ -96,7 +96,7 @@ if not SKIP_CUDA_BUILD:
     if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
         generator_flag = ["-DOLD_GENERATOR_PATH"]
 
-    check_if_cuda_home_none("bit_decode")
+    check_if_cuda_home_none("oscar")
 
     # Check, if CUDA11 is installed for compute capability 8.0
     cc_flag = []
@@ -125,15 +125,15 @@ if not SKIP_CUDA_BUILD:
 
     ext_modules.append(
         CUDAExtension(
-            name="bit_decode_cuda",
+            name="oscar_cuda",
             sources=[
-                "csrc/bit_decode/decode_api.cpp",
-                "csrc/bit_decode/src/k_preprocess.cu",
-                "csrc/bit_decode/src/genfile/flash_fwd_hdim128_fp16_sm80.cu",
-                "csrc/bit_decode/src/genfile/flash_qpack_hdim128_fp16_sm80_2bit.cu",
-                "csrc/bit_decode/src/genfile/flash_qpack_hdim128_fp16_sm80_4bit.cu",
-                "csrc/bit_decode/src/genfile/flash_fwd_split_hdim128_fp16_sm80_2bit.cu",
-                "csrc/bit_decode/src/genfile/flash_fwd_split_hdim128_fp16_sm80_4bit.cu",
+                "csrc/oscar/decode_api.cpp",
+                "csrc/oscar/src/k_preprocess.cu",
+                "csrc/oscar/src/genfile/flash_fwd_hdim128_fp16_sm80.cu",
+                "csrc/oscar/src/genfile/flash_qpack_hdim128_fp16_sm80_2bit.cu",
+                "csrc/oscar/src/genfile/flash_qpack_hdim128_fp16_sm80_4bit.cu",
+                "csrc/oscar/src/genfile/flash_fwd_split_hdim128_fp16_sm80_2bit.cu",
+                "csrc/oscar/src/genfile/flash_fwd_split_hdim128_fp16_sm80_4bit.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"] + generator_flag,
@@ -158,8 +158,8 @@ if not SKIP_CUDA_BUILD:
             },
             extra_link_args=['-Wl,-rpath,{}'.format(os.path.join(torch.__path__[0], 'lib'))],
             include_dirs=[
-                Path(this_dir) / "csrc" / "bit_decode",
-                Path(this_dir) / "csrc" / "bit_decode" / "src",
+                Path(this_dir) / "csrc" / "oscar",
+                Path(this_dir) / "csrc" / "oscar" / "src",
                 Path(this_dir) / "libs" / "cutlass" / "include",
             ],
         )
@@ -167,10 +167,10 @@ if not SKIP_CUDA_BUILD:
 
 
 def get_package_version():
-    with open(Path(this_dir) / "bit_decode" / "__init__.py", "r") as f:
+    with open(Path(this_dir) / "oscar" / "__init__.py", "r") as f:
         version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
-    local_version = os.environ.get("BIT_DECODE_LOCAL_VERSION")
+    local_version = os.environ.get("OSCAR_LOCAL_VERSION")
     if local_version:
         return f"{public_version}+{local_version}"
     else:
@@ -246,12 +246,12 @@ setup(
             "dist",
             "docs",
             "benchmarks",
-            "bit_decode.egg-info",
+            "oscar.egg-info",
         )
     ),
     author="Dayou Du",
     author_email="duda200054@gmail.com",
-    description="BitDecoding",
+    description="OScaR",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/Dao-AILab/flash-attention",

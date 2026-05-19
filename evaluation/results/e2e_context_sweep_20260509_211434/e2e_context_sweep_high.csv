@@ -1,9 +1,0 @@
-variant,context_len,batch_size,decode_len,iteration,status,runtime_s,peak_mem_mb,prefill_latency_s,decode_latency_total_s,decode_latency_per_token_ms,prefill_tps,decode_tps,log_path
-fa2,49152,1,8,1,ok,34.6,39404.02,22.812,1.5827,197.8,2154.66,5.05,evaluation/results/e2e_context_sweep_20260509_211434/fa2_ctx49152.log
-bitdecoding_hn_2bit,49152,1,8,1,ok,35.36,33529.38,23.9734,1.1896,148.7,2050.28,6.73,evaluation/results/e2e_context_sweep_20260509_211434/bitdecoding_hn_2bit_ctx49152.log
-fa2,65536,1,8,1,ok,47.32,47067.02,35.1499,1.8649,233.1,1864.47,4.29,evaluation/results/e2e_context_sweep_20260509_211434/fa2_ctx65536.log
-bitdecoding_hn_2bit,65536,1,8,1,ok,48.49,39231.8,37.0992,1.284,160.5,1766.51,6.23,evaluation/results/e2e_context_sweep_20260509_211434/bitdecoding_hn_2bit_ctx65536.log
-fa2,98304,1,8,1,ok,81.81,62393.0,68.1101,2.462,307.8,1443.31,3.25,evaluation/results/e2e_context_sweep_20260509_211434/fa2_ctx98304.log
-bitdecoding_hn_2bit,98304,1,8,1,ok,82.25,50636.63,70.5803,1.4998,187.5,1392.8,5.33,evaluation/results/e2e_context_sweep_20260509_211434/bitdecoding_hn_2bit_ctx98304.log
-fa2,131072,1,8,1,oom,119.07,,,,,,,evaluation/results/e2e_context_sweep_20260509_211434/fa2_ctx131072.log
-bitdecoding_hn_2bit,131072,1,8,1,ok,126.52,62041.47,114.6718,1.6626,207.8,1143.02,4.81,evaluation/results/e2e_context_sweep_20260509_211434/bitdecoding_hn_2bit_ctx131072.log

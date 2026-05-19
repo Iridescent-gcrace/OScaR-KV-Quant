@@ -1,13 +1,12 @@
 cmake_minimum_required(VERSION 3.22.1)
-project(bitdecoding CUDA CXX)
+project(oscar CUDA CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_ARCHITECTURES 80)
 
-# set(INCLUDE_DIR ${PROJECT_SOURCE_DIR}/../../libs/cutlass/include)
-set(INCLUDE_DIR /home/ddy/Projects/BitDecoding/libs/cutlass)
+set(INCLUDE_DIR ${PROJECT_SOURCE_DIR}/../../libs/cutlass/include)
 
 # Enable ccache if available
 find_program(CCACHE_PROGRAM ccache)
@@ -83,4 +82,3 @@ target_compile_options(test_single_residual PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-
 # target_link_libraries(bench_single_residual "${TORCH_LIBRARIES}")
 # target_include_directories(bench_single_residual PRIVATE ${INCLUDE_DIR})
 # target_compile_options(bench_single_residual PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-maxrregcount=255 -gencode arch=compute_80,code=sm_80 -w>)
-

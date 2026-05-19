@@ -771,7 +771,7 @@ at::Tensor kvcache_qpack_preprocess_k(
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "BitDecoding";
+    m.doc() = "OScaR";
     m.def("preprocess_k_cache", &preprocess_k_cache_cuda, "K cache preprocess with optional Hadamard and token-wise norm");
     m.def("kvcache_pack_int2", &kvcache_qpack<2>, "Forward pass, kvcache quantization and packing (2-bit)");
     m.def("kvcache_pack_int4", &kvcache_qpack<4>, "Forward pass, kvcache quantization and packing (4-bit)");

@@ -18,7 +18,7 @@ SETUP_PY = PROJECT_ROOT / "setup.py"
 
 DEFAULT_MODEL_PATH = os.environ.get(
     "MODEL_PATH",
-    "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-llm/zhichen/huggingface.co/Qwen/Qwen3-8B/",
+    "Qwen/Qwen3-8B",
 )
 
 VARIANTS: Dict[str, Dict[str, str]] = {
@@ -30,8 +30,8 @@ VARIANTS: Dict[str, Dict[str, str]] = {
         "kv_rotation": "none",
         "kv_norm": "0",
     },
-    "bitdecoding_hn": {
-        "attn_backend": "bit_decoding",
+    "oscar_hn": {
+        "attn_backend": "oscar",
         "num_bits": "2",
         "quant_mode": "k-channel",
         "group_size": "32",
@@ -50,24 +50,24 @@ SMOKE_CASES = [
         "iteration": 1,
     },
     {
-        "case_name": "bitdecoding_hn_ctx128_bs1",
-        "variant": "bitdecoding_hn",
+        "case_name": "oscar_hn_ctx128_bs1",
+        "variant": "oscar_hn",
         "batch_size": 1,
         "context_len": 128,
         "decode_len": 1,
         "iteration": 1,
     },
     {
-        "case_name": "bitdecoding_hn_ctx129_bs1",
-        "variant": "bitdecoding_hn",
+        "case_name": "oscar_hn_ctx129_bs1",
+        "variant": "oscar_hn",
         "batch_size": 1,
         "context_len": 129,
         "decode_len": 1,
         "iteration": 1,
     },
     {
-        "case_name": "bitdecoding_hn_ctx1024_bs1",
-        "variant": "bitdecoding_hn",
+        "case_name": "oscar_hn_ctx1024_bs1",
+        "variant": "oscar_hn",
         "batch_size": 1,
         "context_len": 1024,
         "decode_len": 4,
@@ -124,14 +124,14 @@ DECODE_TPS_RE = re.compile(r"Decode Throughput:\s*([0-9.]+) tokens/s")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run smoke/full Qwen3 bit-decoding regression suite.")
+    parser = argparse.ArgumentParser(description="Run smoke/full Qwen3 OScaR regression suite.")
     parser.add_argument("--mode", choices=("smoke", "full"), default="smoke")
     parser.add_argument("--model_path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--python_bin", default=sys.executable)
     parser.add_argument("--output_dir", default=None)
-    parser.add_argument("--tag", default="qwen3_8b_bitdecoding_suite")
+    parser.add_argument("--tag", default="qwen3_8b_oscar_suite")
     parser.add_argument("--skip_build", action="store_true")
     parser.add_argument("--skip_py_compile", action="store_true")
     return parser.parse_args()
@@ -283,7 +283,9 @@ def run_py_compile(args: argparse.Namespace, output_dir: Path, env: Dict[str, st
         "py_compile",
         "evaluation/qwen3.py",
         "evaluation/bench_throughput.py",
-        "bit_decode/bit_decode_interface.py",
+        "eval_longbench.py",
+        "evaluation/scripts/run_qwen3_suite.py",
+        "oscar/oscar_interface.py",
     ]
     proc = run_logged_command(cmd, env, compile_log)
     if proc.returncode != 0:
@@ -308,7 +310,7 @@ def run_smoke(args: argparse.Namespace, output_dir: Path, env: Dict[str, str]) -
 def full_seq_cases() -> List[Dict[str, int | str]]:
     cases: List[Dict[str, int | str]] = []
     for context_len in FULL_SEQ_CONTEXTS:
-        for variant in ("fa2", "bitdecoding_hn"):
+        for variant in ("fa2", "oscar_hn"):
             cases.append(
                 {
                     "case_name": f"{variant}_ctx{context_len}_bs1",
@@ -325,7 +327,7 @@ def full_seq_cases() -> List[Dict[str, int | str]]:
 def full_batch_cases() -> List[Dict[str, int | str]]:
     cases: List[Dict[str, int | str]] = []
     for batch_size in FULL_BATCH_SIZES:
-        for variant in ("fa2", "bitdecoding_hn"):
+        for variant in ("fa2", "oscar_hn"):
             cases.append(
                 {
                     "case_name": f"{variant}_ctx4096_bs{batch_size}",
@@ -374,26 +376,26 @@ def write_full_summary(output_dir: Path, batch_rows: List[Dict[str, object]]) ->
     savings_rows: List[Dict[str, object]] = []
     for batch_size in FULL_BATCH_SIZES:
         fa2 = by_variant_batch["fa2"].get(batch_size)
-        bit = by_variant_batch["bitdecoding_hn"].get(batch_size)
+        oscar = by_variant_batch["oscar_hn"].get(batch_size)
         compare_row: Dict[str, object] = {
             "batch_size": batch_size,
             "context_len": 4096,
             "fa2_status": fa2["status"] if fa2 else "missing",
             "fa2_peak_mem_mb": fa2["peak_mem_mb"] if fa2 else None,
-            "bitdecoding_hn_status": bit["status"] if bit else "missing",
-            "bitdecoding_hn_peak_mem_mb": bit["peak_mem_mb"] if bit else None,
+            "oscar_hn_status": oscar["status"] if oscar else "missing",
+            "oscar_hn_peak_mem_mb": oscar["peak_mem_mb"] if oscar else None,
             "saved_mem_mb": None,
             "saved_mem_ratio": None,
         }
         if (
             fa2
-            and bit
+            and oscar
             and fa2["status"] == "ok"
-            and bit["status"] == "ok"
+            and oscar["status"] == "ok"
             and fa2["peak_mem_mb"] is not None
-            and bit["peak_mem_mb"] is not None
+            and oscar["peak_mem_mb"] is not None
         ):
-            saved_mem_mb = float(fa2["peak_mem_mb"]) - float(bit["peak_mem_mb"])
+            saved_mem_mb = float(fa2["peak_mem_mb"]) - float(oscar["peak_mem_mb"])
             saved_mem_ratio = saved_mem_mb / float(fa2["peak_mem_mb"])
             compare_row["saved_mem_mb"] = saved_mem_mb
             compare_row["saved_mem_ratio"] = saved_mem_ratio
@@ -402,11 +404,11 @@ def write_full_summary(output_dir: Path, batch_rows: List[Dict[str, object]]) ->
                     "batch_size": batch_size,
                     "context_len": 4096,
                     "fa2_peak_mem_mb": fa2["peak_mem_mb"],
-                    "bitdecoding_hn_peak_mem_mb": bit["peak_mem_mb"],
+                    "oscar_hn_peak_mem_mb": oscar["peak_mem_mb"],
                     "saved_mem_mb": saved_mem_mb,
                     "saved_mem_ratio": saved_mem_ratio,
                     "fa2_decode_tps": fa2["decode_tps"],
-                    "bitdecoding_hn_decode_tps": bit["decode_tps"],
+                    "oscar_hn_decode_tps": oscar["decode_tps"],
                 }
             )
         compare_rows.append(compare_row)
@@ -418,8 +420,8 @@ def write_full_summary(output_dir: Path, batch_rows: List[Dict[str, object]]) ->
             "context_len",
             "fa2_status",
             "fa2_peak_mem_mb",
-            "bitdecoding_hn_status",
-            "bitdecoding_hn_peak_mem_mb",
+            "oscar_hn_status",
+            "oscar_hn_peak_mem_mb",
             "saved_mem_mb",
             "saved_mem_ratio",
         ]
@@ -433,11 +435,11 @@ def write_full_summary(output_dir: Path, batch_rows: List[Dict[str, object]]) ->
             "batch_size",
             "context_len",
             "fa2_peak_mem_mb",
-            "bitdecoding_hn_peak_mem_mb",
+            "oscar_hn_peak_mem_mb",
             "saved_mem_mb",
             "saved_mem_ratio",
             "fa2_decode_tps",
-            "bitdecoding_hn_decode_tps",
+            "oscar_hn_decode_tps",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
